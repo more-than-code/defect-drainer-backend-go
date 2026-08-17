@@ -7,7 +7,7 @@
 
 Go control-plane rewrite of the Defect Drainer harness API. Goal: a static binary so operator and EC2 hosts do not need **Node as a runtime**. The live operator API is still TypeScript `backend/` until cutover.
 
-Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`../docs/workflow.md`](../docs/workflow.md).
+Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`../backend/docs/workflow.md`](../backend/docs/workflow.md).
 
 This tree is **PR 0 (stub CLI)** only: `version` works; `serve`, `healthcheck`, and `worker` exit 1 (`not implemented`). No listen, no SQLite.
 

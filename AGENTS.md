@@ -3,7 +3,7 @@
 **Folder:** `backend-go/` · **Git name:** `defect-drainer-go`  
 **Module:** `github.com/joe/defect-drainer-go`
 
-Go control-plane binary (`defect-drainer`) that will replace Node as the harness API runtime. Design: `../docs/go-backend.md`. Framing: `../docs/workflow.md`.
+Go control-plane binary (`defect-drainer`) that will replace Node as the harness API runtime. Design: `../docs/go-backend.md`. Framing: `../backend/docs/workflow.md`.
 
 - Inventory SSOT is **shared**: `backend/.data/defect-drainer.db` + umbrella `../evidence/` — do not invent a second store
 - One writer per data dir (`{DATA}/defect-drainer.lock`). TS must flock too before a shared-DATA experiment
