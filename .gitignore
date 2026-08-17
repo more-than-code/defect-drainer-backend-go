@@ -1,0 +1,11 @@
+.data/
+bin/
+dist/
+# Root-anchored: an unanchored "defect-drainer" would ignore cmd/defect-drainer/.
+/defect-drainer
+/defect-drainer.exe
+*.test
+coverage.out
+.env
+.DS_Store
+SESSION.md
