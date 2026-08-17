@@ -5,20 +5,21 @@
 **Module:** `github.com/joe/defect-drainer-go`  
 **Binary:** `defect-drainer`
 
-Go control-plane rewrite of the Defect Drainer harness API. Goal: a static binary so operator and EC2 hosts do not need **Node as a runtime**. The live operator API is still TypeScript `backend/` until cutover.
+Go control-plane rewrite of the Defect Drainer harness API. Goal: a static binary so operator and EC2 hosts do not need **Node as a runtime**. Compose `api.build` is `../backend-go`; rollback is revert that line to `../backend`. Local TS `pnpm dev` still works when this binary is not running.
 
 Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`../docs/workflow.md`](../docs/workflow.md).
 
-This tree is **PR 0 (stub CLI)** only: `version` works; `serve`, `healthcheck`, and `worker` exit 1 (`not implemented`). No listen, no SQLite.
+`serve` listens after POSIX `flock` + SQLite open and serves the console HTTP contract (inventory, intake, batches, search). `healthcheck` GETs `HOST:PORT/health` and exits 0 only when HTTP 200 **and** `ok: true`. The `worker` **subcommand** is still reserved (exit 1); batch-fix spawn runs **in-process** from `serve` (TS model).
 
 ## Run
 
 ```bash
-cd /Users/joe/workspace/defect-drainer/backend-go
+cd /Users/joe/workspace/defect-drainer-go-rewrite/backend-go
 go test ./...
 go run ./cmd/defect-drainer version
-# later:
-# go run ./cmd/defect-drainer serve
+export DEFECTS_ROOT=/Users/joe/workspace/defect-drainer
+export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer-go-rewrite/runtime
+go run ./cmd/defect-drainer serve
 ```
 
 Or `make test` / `make build` (`CGO_ENABLED=0`). Cross-compile: `make cross-linux`.
@@ -27,8 +28,7 @@ Or `make test` / `make build` (`CGO_ENABLED=0`). Cross-compile: `make cross-linu
 
 The inventory is **one SQLite file** plus umbrella `evidence/`. Only one backend process (TS **or** Go) may write a given data dir.
 
-- Mutex: both TS (coexistence lock PR) and Go take `LOCK_EX|LOCK_NB` on `{DATA}/defect-drainer.lock`.
-- Flock only in Go does **not** stop the TS backend. Do not point both at the same DATA until that TS PR is in.
+- Mutex: both TS (`koffi` → `libc.flock`) and Go (`syscall.Flock`) take `LOCK_EX|LOCK_NB` on `{DATA}/defect-drainer.lock`. A second locker fails immediately and does not listen.
 - Operator backup: never start two servers against one data dir.
 
 ## Fail-closed paths (`serve`, not `healthcheck`)
@@ -52,9 +52,21 @@ export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend/.data
 
 `healthcheck` uses **HOST/PORT only** (default `127.0.0.1:8788`). It does not walk `go.mod`, flock, or open SQLite.
 
+## Batch-fix (in `serve`, after worktrees)
+
+`POST /api/batches` with `start_fix: true` and `mode: grok` follows the TS path:
+
+1. Flip selected `open` / `triaged` defects to `in_progress`.
+2. Create `git worktree`s (`defect-drainer/<BATCH-id>`). No local/repo URLs → **400** and `syncBatchAndDefects(..., failed)` (defects reopen).
+3. Persist bindings on `job.worktrees`. Empty worktrees refuse spawn.
+4. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`).
+5. `POST /api/batch-jobs/{id}/create-prs` and `refresh-prs` run host `gh` (`GH_BIN` overrides) and write `job.prs[]` (`status`, `url`, `ghState`, `mergedAt`, `checkedAt`). Skip when there are no commits vs the resolved base (never `origin/origin/main`).
+
+`start_fix: true` + `manual` stays planned / job `manual` and does **not** flip defects.
+
 ## What stays on the worker host
 
-`git`, `gh`, and the coding-agent CLI are **not** replaced by this binary. They are required only on machines that run batch-fix (later PRs). Inventory/console do not need them.
+`git`, `gh`, and the coding-agent CLI are **not** replaced by this binary. They are required only on machines that run batch-fix. Tests inject fakes via `GROK_BUILD_BIN` and `GH_BIN`. Inventory/console do not need them.
 
 ## Related
 

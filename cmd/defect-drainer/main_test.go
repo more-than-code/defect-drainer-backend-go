@@ -17,25 +17,13 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
-func TestRunStubs(t *testing.T) {
-	for _, cmd := range []string{"serve", "healthcheck", "worker", ""} {
-		name := cmd
-		if name == "" {
-			name = "(default serve)"
-		}
-		t.Run(name, func(t *testing.T) {
-			var args []string
-			if cmd != "" {
-				args = []string{cmd}
-			}
-			got := capture(t, func() int { return run(args) })
-			if got.code != 1 {
-				t.Fatalf("exit %d", got.code)
-			}
-			if !bytes.Contains([]byte(got.err), []byte("not implemented")) {
-				t.Fatalf("stderr %q", got.err)
-			}
-		})
+func TestRunWorkerStillStub(t *testing.T) {
+	got := capture(t, func() int { return run([]string{"worker"}) })
+	if got.code != 1 {
+		t.Fatalf("exit %d", got.code)
+	}
+	if !bytes.Contains([]byte(got.err), []byte("not implemented")) {
+		t.Fatalf("stderr %q", got.err)
 	}
 }
 
@@ -43,6 +31,15 @@ func TestRunUnknown(t *testing.T) {
 	got := capture(t, func() int { return run([]string{"frobnicate"}) })
 	if got.code != 2 {
 		t.Fatalf("exit %d", got.code)
+	}
+}
+
+func TestHealthcheckFailsWhenNothingListens(t *testing.T) {
+	t.Setenv("DEFECT_DRAINER_HOST", "127.0.0.1")
+	t.Setenv("DEFECT_DRAINER_PORT", "1")
+	got := capture(t, func() int { return run([]string{"healthcheck"}) })
+	if got.code == 0 {
+		t.Fatal("healthcheck must fail when /health is unreachable")
 	}
 }
 

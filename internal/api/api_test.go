@@ -1,0 +1,562 @@
+package api_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/joe/defect-drainer-go/internal/api"
+	"github.com/joe/defect-drainer-go/internal/db"
+	"github.com/joe/defect-drainer-go/internal/git"
+	"github.com/joe/defect-drainer-go/internal/store"
+)
+
+func testApp(t *testing.T) *api.App {
+	t.Helper()
+	defects := t.TempDir()
+	data := t.TempDir()
+	app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, SkipMigrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.Close)
+	return app
+}
+
+func doJSON(t *testing.T, h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestHealthAppsEvidenceReadPath(t *testing.T) {
+	app := testApp(t)
+
+	h := doJSON(t, app.Handler, http.MethodGet, "/health", nil)
+	if h.Code != 200 {
+		t.Fatalf("health %d %s", h.Code, h.Body)
+	}
+	var health map[string]any
+	if err := json.Unmarshal(h.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if health["ok"] != true {
+		t.Fatalf("ok %+v", health)
+	}
+	if health["service"] != "defect-drainer" {
+		t.Fatalf("service %+v", health)
+	}
+
+	apps := doJSON(t, app.Handler, http.MethodGet, "/api/apps", nil)
+	if apps.Code != 200 {
+		t.Fatalf("apps %d %s", apps.Code, apps.Body)
+	}
+	var ap struct {
+		DefaultAppID string           `json:"defaultAppId"`
+		Apps         []map[string]any `json:"apps"`
+	}
+	if err := json.Unmarshal(apps.Body.Bytes(), &ap); err != nil {
+		t.Fatal(err)
+	}
+	if ap.DefaultAppID != store.SeededTutoredWebappAppID {
+		t.Fatalf("defaultAppId %s", ap.DefaultAppID)
+	}
+	found := false
+	for _, a := range ap.Apps {
+		if a["id"] == store.SeededTutoredWebappAppID {
+			found = true
+			if a["grok_sandbox"] != "strict" {
+				t.Fatalf("sandbox %+v", a)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("seeded webapp missing")
+	}
+
+	one := doJSON(t, app.Handler, http.MethodGet, "/api/apps/"+store.SeededTutoredWebappAppID, nil)
+	if one.Code != 200 {
+		t.Fatalf("get app %d", one.Code)
+	}
+
+	list := doJSON(t, app.Handler, http.MethodGet, "/api/defects?bucket=open", nil)
+	if list.Code != 200 {
+		t.Fatalf("defects %d", list.Code)
+	}
+
+	bad := doJSON(t, app.Handler, http.MethodGet, "/evidence/not-an-id/01.png", nil)
+	if bad.Code != 400 {
+		t.Fatalf("bad evidence %d", bad.Code)
+	}
+	miss := doJSON(t, app.Handler, http.MethodGet, "/evidence/DEF-20260817-x-abcd/01.png", nil)
+	if miss.Code != 404 {
+		t.Fatalf("missing evidence %d", miss.Code)
+	}
+
+	st := doJSON(t, app.Handler, http.MethodGet, "/api/search/status", nil)
+	if st.Code != 200 {
+		t.Fatalf("search status %d", st.Code)
+	}
+	var ss map[string]any
+	_ = json.Unmarshal(st.Body.Bytes(), &ss)
+	if ss["enabled"] != false {
+		t.Fatalf("opensearch should be disabled: %+v", ss)
+	}
+}
+
+func TestSecondLockFails(t *testing.T) {
+	defects := t.TempDir()
+	data := t.TempDir()
+	a, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, SkipMigrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	_, err = api.Build(api.Options{DefectsRoot: defects, DataRoot: data, SkipMigrate: true})
+	if err == nil || !strings.Contains(err.Error(), data) {
+		t.Fatalf("expected lock error naming data dir, got %v", err)
+	}
+}
+
+func TestIntakeOmitReporterAndResolveGate(t *testing.T) {
+	app := testApp(t)
+	rec := doJSON(t, app.Handler, http.MethodPost, "/api/intake/json", map[string]any{
+		"comment": "Submit button does nothing on practice hub",
+		"severity": "P1",
+		"client":   "web",
+		"surface":  "practice hub",
+		"app_id":   store.SeededTutoredWebappAppID,
+		"repos":    []string{"webapp"},
+		"mode":     "local",
+	})
+	if rec.Code != 202 {
+		t.Fatalf("intake %d %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Job struct {
+			Status   string `json:"status"`
+			DefectID string `json:"defectId"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Job.Status != "completed" {
+		t.Fatalf("status %s", out.Job.Status)
+	}
+	got := doJSON(t, app.Handler, http.MethodGet, "/api/defects/"+out.Job.DefectID, nil)
+	if got.Code != 200 {
+		t.Fatalf("get defect %d %s", got.Code, got.Body)
+	}
+	var wrap struct {
+		Defect store.DefectRecord `json:"defect"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &wrap); err != nil {
+		t.Fatal(err)
+	}
+	if wrap.Defect.Reporter != "" {
+		t.Fatalf("omitted reporter must be empty, got %q", wrap.Defect.Reporter)
+	}
+	if wrap.Defect.CreatedAt == "" || wrap.Defect.Path == "" {
+		t.Fatalf("created_at/path missing: %+v", wrap.Defect)
+	}
+
+	bad := doJSON(t, app.Handler, http.MethodPost, "/api/defects/"+out.Job.DefectID+"/resolve", map[string]any{})
+	if bad.Code != 400 || !strings.Contains(bad.Body.String(), "fix_evidence") {
+		t.Fatalf("resolve without proof: %d %s", bad.Code, bad.Body)
+	}
+
+	ok := doJSON(t, app.Handler, http.MethodPost, "/api/defects/"+out.Job.DefectID+"/resolve", map[string]any{
+		"fix_evidence": []string{"evidence/" + out.Job.DefectID + "/fix-01.png"},
+	})
+	if ok.Code != 200 {
+		t.Fatalf("resolve with virtual proof %d %s", ok.Code, ok.Body)
+	}
+}
+
+func TestHostileBaseBranchFallback(t *testing.T) {
+	app := testApp(t)
+	res := doJSON(t, app.Handler, http.MethodPatch, "/api/apps/"+store.SeededTutoredWebappAppID, map[string]any{
+		"base_branch": "--upload-pack=evil",
+	})
+	if res.Code != 200 {
+		t.Fatalf("patch %d %s", res.Code, res.Body)
+	}
+	var wrap struct {
+		App store.AppRecord `json:"app"`
+	}
+	_ = json.Unmarshal(res.Body.Bytes(), &wrap)
+	if wrap.App.BaseBranch != "main" {
+		t.Fatalf("hostile branch stored %q", wrap.App.BaseBranch)
+	}
+}
+
+func TestBatchPhase1DecisionTable(t *testing.T) {
+	app := testApp(t)
+	// need a defect id for the batch body
+	in := doJSON(t, app.Handler, http.MethodPost, "/api/intake/json", map[string]any{
+		"comment": "batch target",
+		"app_id":  store.SeededTutoredWebappAppID,
+		"mode":    "local",
+	})
+	var job struct {
+		Job struct{ DefectID string `json:"defectId"` } `json:"job"`
+	}
+	_ = json.Unmarshal(in.Body.Bytes(), &job)
+
+	grok := doJSON(t, app.Handler, http.MethodPost, "/api/batches", map[string]any{
+		"app_id":     store.SeededTutoredWebappAppID,
+		"title":      "fix",
+		"defect_ids": []string{job.Job.DefectID},
+		"start_fix":  true,
+		"mode":       "grok",
+	})
+	// After worker PRs: seeded apps have no local URLs → worktrees fail → 400.
+	if grok.Code != 400 {
+		t.Fatalf("batch grok %d %s", grok.Code, grok.Body)
+	}
+	if !strings.Contains(grok.Body.String(), "worktrees") && !strings.Contains(grok.Body.String(), "repos") {
+		t.Fatalf("expected worktree failure, got %s", grok.Body)
+	}
+	d := doJSON(t, app.Handler, http.MethodGet, "/api/defects/"+job.Job.DefectID, nil)
+	var wrap struct {
+		Defect store.DefectRecord `json:"defect"`
+	}
+	_ = json.Unmarshal(d.Body.Bytes(), &wrap)
+	if wrap.Defect.Status == "in_progress" {
+		t.Fatal("phase1 must not flip defects to in_progress")
+	}
+
+	manual := doJSON(t, app.Handler, http.MethodPost, "/api/batches", map[string]any{
+		"app_id":     store.SeededTutoredWebappAppID,
+		"title":      "manual",
+		"defect_ids": []string{job.Job.DefectID},
+		"start_fix":  true,
+		"mode":       "manual",
+	})
+	if manual.Code != 201 {
+		t.Fatalf("manual %d %s", manual.Code, manual.Body)
+	}
+
+	stop := doJSON(t, app.Handler, http.MethodPost, "/api/batch-jobs/bjob_x/stop", nil)
+	if stop.Code != 404 && stop.Code != 400 {
+		t.Fatalf("stop %d %s", stop.Code, stop.Body)
+	}
+}
+
+func TestAnalyticsAndFTS(t *testing.T) {
+	app := testApp(t)
+	_, err := app.Store.Write(store.DefectRecord{
+		ID: "DEF-20260809-analytics-login-fail-a1b2", AppID: store.SeededTutoredWebappAppID,
+		Title: "Login button no-op on iOS", Severity: "P1", Status: "open", Area: "auth",
+		Client: "ios", Surface: "login", Repos: []string{"webapp"},
+		Source: "web-ui", Reported: "2026-08-09", Summary: "Tapping login does nothing",
+		Body: "Expected navigate home. Actual no-op.", Bucket: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := doJSON(t, app.Handler, http.MethodGet, "/api/analytics?app_id="+store.SeededTutoredWebappAppID, nil)
+	if sum.Code != 200 {
+		t.Fatalf("analytics %d %s", sum.Code, sum.Body)
+	}
+	var payload struct {
+		Analytics struct {
+			Jobs struct {
+				SuccessRate *float64 `json:"success_rate"`
+			} `json:"jobs"`
+			Prompts struct {
+				Top []struct {
+					LastUsed string `json:"last_used"`
+				} `json:"top"`
+			} `json:"prompts"`
+		} `json:"analytics"`
+	}
+	if err := json.Unmarshal(sum.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Analytics.Jobs.SuccessRate != nil {
+		t.Fatalf("success_rate must be null when denom=0, got %v", *payload.Analytics.Jobs.SuccessRate)
+	}
+
+	sr := doJSON(t, app.Handler, http.MethodGet, "/api/search?q=login&app_id="+store.SeededTutoredWebappAppID, nil)
+	if sr.Code != 200 {
+		t.Fatalf("search %d %s", sr.Code, sr.Body)
+	}
+	var res struct {
+		Mode string `json:"mode"`
+		Hits []struct {
+			ArtifactType string `json:"artifact_type"`
+			ID           string `json:"id"`
+		} `json:"hits"`
+	}
+	_ = json.Unmarshal(sr.Body.Bytes(), &res)
+	if res.Mode != "fts" && res.Mode != "like" && res.Mode != "recent" {
+		t.Fatalf("mode %s", res.Mode)
+	}
+	found := false
+	for _, h := range res.Hits {
+		if h.ID == "DEF-20260809-analytics-login-fail-a1b2" && h.ArtifactType == "defect_summary" {
+			found = true
+		}
+	}
+	if !found && res.Mode == "fts" {
+		t.Fatalf("expected FTS hit: %s", sr.Body)
+	}
+}
+
+func TestEvidencePrefixAndFile(t *testing.T) {
+	app := testApp(t)
+	id := "DEF-20260817-ev-abcd"
+	_, err := app.Store.Write(store.DefectRecord{
+		ID: id, AppID: store.SeededTutoredWebappAppID, Title: "e",
+		Severity: "P2", Status: "open", Area: "other", Client: "web",
+		Reported: "2026-08-17", Summary: "e", Body: "e", Bucket: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(app.Roots.DefectsRoot, "evidence", id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "01.png"), []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, app.Handler, http.MethodGet, "/evidence/"+id+"/01.png", nil)
+	if rec.Code != 200 {
+		t.Fatalf("evidence %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "image/png") {
+		t.Fatalf("content-type %s", ct)
+	}
+	slash := doJSON(t, app.Handler, http.MethodGet, "/evidence/"+id+"/..%2F01.png", nil)
+	if slash.Code != 400 && slash.Code != 404 {
+		t.Fatalf("traversal %d", slash.Code)
+	}
+}
+
+func writeExec(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func initGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s", args, out)
+		}
+	}
+	run("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "README")
+	run("commit", "-m", "init")
+}
+
+func TestWorkerSpawnAndGhPRRoutes(t *testing.T) {
+	app := testApp(t)
+	primary := t.TempDir()
+	initGitRepo(t, primary)
+
+	mark := filepath.Join(t.TempDir(), "spawned")
+	grok := filepath.Join(t.TempDir(), "fake-grok")
+	writeExec(t, grok, "#!/bin/sh\necho spawned > \""+mark+"\"\nexit 0\n")
+	ghLog := filepath.Join(t.TempDir(), "gh.log")
+	gh := filepath.Join(t.TempDir(), "fake-gh")
+	writeExec(t, gh, `#!/bin/sh
+echo "$@" >> "`+ghLog+`"
+args="$*"
+case "$args" in
+  *pr\ create*) echo 'https://github.com/example/demo/pull/7'; exit 0 ;;
+  *pr\ view*) echo '{"state":"MERGED","mergedAt":"2026-08-17T12:00:00Z","number":7,"url":"https://github.com/example/demo/pull/7"}'; exit 0 ;;
+  *pr\ list*) echo '[]'; exit 0 ;;
+esac
+exit 1
+`)
+	t.Setenv("GROK_BUILD_BIN", grok)
+	t.Setenv("GH_BIN", gh)
+
+	patched := doJSON(t, app.Handler, http.MethodPatch, "/api/apps/"+store.SeededTutoredWebappAppID, map[string]any{
+		"repo_entries": []map[string]any{
+			{"name": "demo", "url": primary, "base_source": "local", "base_branch": "main"},
+		},
+	})
+	if patched.Code != 200 {
+		t.Fatalf("patch app %d %s", patched.Code, patched.Body)
+	}
+
+	in := doJSON(t, app.Handler, http.MethodPost, "/api/intake/json", map[string]any{
+		"comment": "worker target",
+		"app_id":  store.SeededTutoredWebappAppID,
+		"mode":    "local",
+	})
+	var intake struct {
+		Job struct {
+			DefectID string `json:"defectId"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(in.Body.Bytes(), &intake); err != nil {
+		t.Fatal(err)
+	}
+
+	created := doJSON(t, app.Handler, http.MethodPost, "/api/batches", map[string]any{
+		"app_id":     store.SeededTutoredWebappAppID,
+		"title":      "worker batch",
+		"defect_ids": []string{intake.Job.DefectID},
+		"start_fix":  true,
+		"mode":       "grok",
+	})
+	if created.Code != 201 {
+		t.Fatalf("batch %d %s", created.Code, created.Body)
+	}
+	var batchOut struct {
+		Batch struct{ Status string `json:"status"` } `json:"batch"`
+		Job   struct {
+			ID        string               `json:"id"`
+			Status    string               `json:"status"`
+			Worktrees []git.WorktreeBinding `json:"worktrees"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &batchOut); err != nil {
+		t.Fatal(err)
+	}
+	if len(batchOut.Job.Worktrees) == 0 {
+		t.Fatalf("expected worktrees on job: %s", created.Body)
+	}
+	d := doJSON(t, app.Handler, http.MethodGet, "/api/defects/"+intake.Job.DefectID, nil)
+	var dw struct {
+		Defect store.DefectRecord `json:"defect"`
+	}
+	_ = json.Unmarshal(d.Body.Bytes(), &dw)
+	if dw.Defect.Status != "in_progress" {
+		t.Fatalf("defect should be in_progress after worker start, got %s", dw.Defect.Status)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(mark); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(mark); err != nil {
+		t.Fatal("coding agent bin was not exec'd")
+	}
+
+	// wait until spawn is no longer running so create-prs is allowed
+	idleUntil := time.Now().Add(2 * time.Second)
+	for time.Now().Before(idleUntil) {
+		got := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/"+batchOut.Job.ID, nil)
+		if !strings.Contains(got.Body.String(), `"status":"running"`) &&
+			!strings.Contains(got.Body.String(), `"status":"queued"`) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	wt := batchOut.Job.Worktrees[0].WorktreeAbs
+	if err := os.WriteFile(filepath.Join(wt, "fix.txt"), []byte("done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "add", "fix.txt")
+	cmd.Dir = wt
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("add: %s", out)
+	}
+	cmd = exec.Command("git", "commit", "-m", "fix")
+	cmd.Dir = wt
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("commit: %s", out)
+	}
+
+	prs := doJSON(t, app.Handler, http.MethodPost, "/api/batch-jobs/"+batchOut.Job.ID+"/create-prs", nil)
+	if prs.Code != 200 {
+		t.Fatalf("create-prs %d %s", prs.Code, prs.Body)
+	}
+	var prOut struct {
+		PRs []struct {
+			URL    string `json:"url"`
+			Status string `json:"status"`
+			Repo   string `json:"repo"`
+		} `json:"prs"`
+	}
+	if err := json.Unmarshal(prs.Body.Bytes(), &prOut); err != nil {
+		t.Fatal(err)
+	}
+	if len(prOut.PRs) == 0 || prOut.PRs[0].URL != "https://github.com/example/demo/pull/7" || prOut.PRs[0].Status != "created" {
+		t.Fatalf("prs not persisted from gh: %s", prs.Body)
+	}
+	ghBytes, _ := os.ReadFile(ghLog)
+	if !strings.Contains(string(ghBytes), "pr create") {
+		t.Fatalf("fake gh was not invoked for create: %s", ghBytes)
+	}
+
+	ref := doJSON(t, app.Handler, http.MethodPost, "/api/batch-jobs/"+batchOut.Job.ID+"/refresh-prs", nil)
+	if ref.Code != 200 {
+		t.Fatalf("refresh-prs %d %s", ref.Code, ref.Body)
+	}
+	var refOut struct {
+		PRs []struct {
+			GhState  string `json:"ghState"`
+			MergedAt string `json:"mergedAt"`
+		} `json:"prs"`
+	}
+	if err := json.Unmarshal(ref.Body.Bytes(), &refOut); err != nil {
+		t.Fatal(err)
+	}
+	if len(refOut.PRs) == 0 || refOut.PRs[0].GhState != "merged" || refOut.PRs[0].MergedAt == "" {
+		t.Fatalf("refresh did not apply gh view: %s", ref.Body)
+	}
+}
+
+func TestSpawnRefusesEmptyWorktrees(t *testing.T) {
+	_, err := git.StartCodingAgent(t.TempDir(), "BATCH-x", t.TempDir(), nil)
+	if err == nil || !strings.Contains(err.Error(), "without worktrees") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestLockFileCreated(t *testing.T) {
+	app := testApp(t)
+	if _, err := os.Stat(filepath.Join(app.Roots.DataRoot, "defect-drainer.lock")); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.NowIso()
+}
