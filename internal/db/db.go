@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS apps (
   repo_urls_json TEXT NOT NULL DEFAULT '[]',
   /** Agent sandbox profile: strict | workspace (per App Settings) */
   grok_sandbox TEXT NOT NULL DEFAULT 'strict',
+  /** Pre-provisioned agent toolchain: none | flutter (per App Settings) */
+  agent_toolchain TEXT NOT NULL DEFAULT 'none',
+  /** Grant Simulator device-tree writes for batch jobs (per App Settings) */
+  allow_simulator_writes INTEGER NOT NULL DEFAULT 0,
+  /** Operator-defined verification commands re-run by DD after a fix job */
+  verify_commands_json TEXT NOT NULL DEFAULT '[]',
   /** Batch-fix base: worktrees branch from <base_remote>/<base_branch>; PRs target base_branch. */
   base_remote TEXT NOT NULL DEFAULT 'origin',
   base_branch TEXT NOT NULL DEFAULT 'main',
@@ -197,6 +203,9 @@ func migrateAppColumns(sqlDB *sql.DB) error {
 		ddl  string
 	}{
 		{"grok_sandbox", `ALTER TABLE apps ADD COLUMN grok_sandbox TEXT NOT NULL DEFAULT 'strict'`},
+		{"agent_toolchain", `ALTER TABLE apps ADD COLUMN agent_toolchain TEXT NOT NULL DEFAULT 'none'`},
+		{"allow_simulator_writes", `ALTER TABLE apps ADD COLUMN allow_simulator_writes INTEGER NOT NULL DEFAULT 0`},
+		{"verify_commands_json", `ALTER TABLE apps ADD COLUMN verify_commands_json TEXT NOT NULL DEFAULT '[]'`},
 		{"base_remote", `ALTER TABLE apps ADD COLUMN base_remote TEXT NOT NULL DEFAULT 'origin'`},
 		{"base_branch", `ALTER TABLE apps ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'`},
 	}

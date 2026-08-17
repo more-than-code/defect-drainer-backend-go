@@ -18,6 +18,62 @@ type AppRepoEntry struct {
 	BaseBranch string `json:"base_branch,omitempty"`
 }
 
+// VerifyCommand is an operator-defined check DD re-runs in a worktree after a
+// fix job. Operator-authored on purpose: the runner is not sandboxed, so
+// executing strings written by the coding agent would be unsandboxed execution
+// on the host.
+type VerifyCommand struct {
+	Repo    string `json:"repo"`
+	Command string `json:"command"`
+}
+
+// NormalizeVerifyCommands drops blanks and caps size, matching the TS store.
+func NormalizeVerifyCommands(in []VerifyCommand) []VerifyCommand {
+	out := []VerifyCommand{}
+	for _, v := range in {
+		repo := strings.TrimSpace(v.Repo)
+		cmd := strings.TrimSpace(v.Command)
+		if repo == "" || cmd == "" || len(cmd) > 500 {
+			continue
+		}
+		out = append(out, VerifyCommand{Repo: repo, Command: cmd})
+		if len(out) == 20 {
+			break
+		}
+	}
+	return out
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "[]"
+	}
+	return string(b)
+}
+
+func parseStoredVerifyCommands(raw string) []VerifyCommand {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var v []VerifyCommand
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return nil
+	}
+	got := NormalizeVerifyCommands(v)
+	if len(got) == 0 {
+		return nil
+	}
+	return got
+}
+
 // AppRecord is the console App JSON object.
 type AppRecord struct {
 	ID            string         `json:"id"`
@@ -29,12 +85,18 @@ type AppRecord struct {
 	RepoURL       string         `json:"repo_url,omitempty"`
 	RepoURLs      []string       `json:"repo_urls,omitempty"`
 	GrokSandbox   string         `json:"grok_sandbox,omitempty"`
-	BaseRemote    string         `json:"base_remote,omitempty"`
-	BaseBranch    string         `json:"base_branch,omitempty"`
-	Default       bool           `json:"default"`
+	// AgentToolchain pre-provisions a toolchain into the job handoff: none | flutter.
+	AgentToolchain string `json:"agent_toolchain,omitempty"`
+	// AllowSimulatorWrites grants the job Simulator device-tree writes.
+	AllowSimulatorWrites bool `json:"allow_simulator_writes,omitempty"`
+	// VerifyCommands are re-run by DD after a fix job; all must pass to resolve.
+	VerifyCommands []VerifyCommand `json:"verify_commands,omitempty"`
+	BaseRemote     string          `json:"base_remote,omitempty"`
+	BaseBranch     string          `json:"base_branch,omitempty"`
+	Default        bool            `json:"default"`
 }
 
-const appSelect = `id, name, description, workspace_root, repos_json, repo_url, repo_urls_json, grok_sandbox, base_remote, base_branch, is_default`
+const appSelect = `id, name, description, workspace_root, repos_json, repo_url, repo_urls_json, grok_sandbox, agent_toolchain, allow_simulator_writes, verify_commands_json, base_remote, base_branch, is_default`
 
 func nameFromRepoURL(url string) string {
 	u := strings.TrimRight(url, "/")
@@ -233,7 +295,7 @@ func persistRepoColumns(entries []AppRepoEntry) (reposJSON string, repoURL sql.N
 	return
 }
 
-func rowToApp(id, name string, description, workspace, reposJSON, repoURL, repoURLsJSON, sandbox, remote, branch sql.NullString, isDefault int) AppRecord {
+func rowToApp(id, name string, description, workspace, reposJSON, repoURL, repoURLsJSON, sandbox, toolchain, verifyJSON, remote, branch sql.NullString, simWrites, isDefault int) AppRecord {
 	entries := parseStoredRepoEntries(repoURLsJSON.String, repoURL.String, reposJSON.String)
 	var urls []string
 	var names []string
@@ -249,14 +311,17 @@ func rowToApp(id, name string, description, workspace, reposJSON, repoURL, repoU
 		names = db.ParseJSONArray(reposJSON.String)
 	}
 	rec := AppRecord{
-		ID:          id,
-		Name:        name,
-		Repos:       names,
-		RepoEntries: entries,
-		GrokSandbox: ParseGrokSandbox(sandbox.String),
-		BaseRemote:  ParseGitRefName(remote.String, "origin"),
-		BaseBranch:  ParseGitRefName(branch.String, "main"),
-		Default:     isDefault != 0,
+		ID:                   id,
+		Name:                 name,
+		Repos:                names,
+		RepoEntries:          entries,
+		GrokSandbox:          ParseGrokSandbox(sandbox.String),
+		AgentToolchain:       ParseAgentToolchain(toolchain.String),
+		AllowSimulatorWrites: simWrites != 0,
+		VerifyCommands:       parseStoredVerifyCommands(verifyJSON.String),
+		BaseRemote:           ParseGitRefName(remote.String, "origin"),
+		BaseBranch:           ParseGitRefName(branch.String, "main"),
+		Default:              isDefault != 0,
 	}
 	if description.Valid && description.String != "" {
 		rec.Description = description.String
@@ -276,12 +341,12 @@ func scanApp(scanner interface {
 	Scan(dest ...any) error
 }) (AppRecord, error) {
 	var id, name string
-	var desc, ws, reposJSON, repoURL, urlsJSON, sandbox, remote, branch sql.NullString
-	var isDefault int
-	if err := scanner.Scan(&id, &name, &desc, &ws, &reposJSON, &repoURL, &urlsJSON, &sandbox, &remote, &branch, &isDefault); err != nil {
+	var desc, ws, reposJSON, repoURL, urlsJSON, sandbox, toolchain, verifyJSON, remote, branch sql.NullString
+	var simWrites, isDefault int
+	if err := scanner.Scan(&id, &name, &desc, &ws, &reposJSON, &repoURL, &urlsJSON, &sandbox, &toolchain, &simWrites, &verifyJSON, &remote, &branch, &isDefault); err != nil {
 		return AppRecord{}, err
 	}
-	return rowToApp(id, name, desc, ws, reposJSON, repoURL, urlsJSON, sandbox, remote, branch, isDefault), nil
+	return rowToApp(id, name, desc, ws, reposJSON, repoURL, urlsJSON, sandbox, toolchain, verifyJSON, remote, branch, simWrites, isDefault), nil
 }
 
 // ListApps ORDER BY is_default DESC, name ASC.
@@ -436,10 +501,13 @@ func CreateApp(sqlDB *sql.DB, input AppRecord) (AppRecord, error) {
 	_, err := sqlDB.Exec(`
     INSERT INTO apps (
       id, name, description, workspace_root, repos_json, repo_url, repo_urls_json,
-      grok_sandbox, base_remote, base_branch, is_default, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      grok_sandbox, agent_toolchain, allow_simulator_writes, verify_commands_json,
+      base_remote, base_branch, is_default, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, name, desc, ws, reposJSON, nullStr(repoURL), urlsJSON,
-		sandbox, ParseGitRefName(input.BaseRemote, "origin"), ParseGitRefName(input.BaseBranch, "main"),
+		sandbox, ParseAgentToolchain(input.AgentToolchain), boolToInt(input.AllowSimulatorWrites),
+		mustJSON(NormalizeVerifyCommands(input.VerifyCommands)),
+		ParseGitRefName(input.BaseRemote, "origin"), ParseGitRefName(input.BaseBranch, "main"),
 		def, ts, ts,
 	)
 	if err != nil {
@@ -512,6 +580,15 @@ func UpdateAppSettings(sqlDB *sql.DB, appID string, patch AppRecord, has map[str
 	if has["grok_sandbox"] {
 		next.GrokSandbox = ParseGrokSandbox(patch.GrokSandbox)
 	}
+	if has["agent_toolchain"] {
+		next.AgentToolchain = ParseAgentToolchain(patch.AgentToolchain)
+	}
+	if has["allow_simulator_writes"] {
+		next.AllowSimulatorWrites = patch.AllowSimulatorWrites
+	}
+	if has["verify_commands"] {
+		next.VerifyCommands = NormalizeVerifyCommands(patch.VerifyCommands)
+	}
 	if has["base_remote"] {
 		next.BaseRemote = ParseGitRefName(patch.BaseRemote, "origin")
 	}
@@ -570,11 +647,15 @@ func UpdateAppSettings(sqlDB *sql.DB, appID string, patch AppRecord, has map[str
 	}
 	_, err = sqlDB.Exec(`UPDATE apps SET
       name = ?, description = ?, workspace_root = ?, repos_json = ?,
-      repo_url = ?, repo_urls_json = ?, grok_sandbox = ?, base_remote = ?,
+      repo_url = ?, repo_urls_json = ?, grok_sandbox = ?, agent_toolchain = ?,
+      allow_simulator_writes = ?, verify_commands_json = ?, base_remote = ?,
       base_branch = ?, is_default = ?, updated_at = ?
      WHERE id = ?`,
 		next.Name, desc, ws, reposJSON, nullStr(repoURL), urlsJSON,
 		ParseGrokSandbox(next.GrokSandbox),
+		ParseAgentToolchain(next.AgentToolchain),
+		boolToInt(next.AllowSimulatorWrites),
+		mustJSON(NormalizeVerifyCommands(next.VerifyCommands)),
 		ParseGitRefName(next.BaseRemote, "origin"),
 		ParseGitRefName(next.BaseBranch, "main"),
 		def, ts, id,

@@ -54,12 +54,12 @@ var legacyUmbrellaHash = AppIDFromSeed("tutored")
 
 func legacyAppIDs() map[string]string {
 	return map[string]string{
-		"tutored":             SeededTutoredWebappAppID,
-		"tutored-webapp":      SeededTutoredWebappAppID,
-		"tutored-web":         SeededTutoredWebappAppID,
-		"tutored-mobileapp":   SeededTutoredMobileAppID,
-		"tutored-mobile":      SeededTutoredMobileAppID,
-		legacyUmbrellaHash:    SeededTutoredWebappAppID,
+		"tutored":           SeededTutoredWebappAppID,
+		"tutored-webapp":    SeededTutoredWebappAppID,
+		"tutored-web":       SeededTutoredWebappAppID,
+		"tutored-mobileapp": SeededTutoredMobileAppID,
+		"tutored-mobile":    SeededTutoredMobileAppID,
+		legacyUmbrellaHash:  SeededTutoredWebappAppID,
 	}
 }
 
@@ -89,6 +89,14 @@ func ParseGrokSandbox(v string) string {
 		return "workspace"
 	}
 	return "strict"
+}
+
+// ParseAgentToolchain mirrors the TS parseAgentToolchain: unknown means none.
+func ParseAgentToolchain(v string) string {
+	if strings.ToLower(strings.TrimSpace(v)) == "flutter" {
+		return "flutter"
+	}
+	return "none"
 }
 
 // ParseGitRefName allowlists ref names; hostile values fall back.

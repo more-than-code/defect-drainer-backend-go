@@ -72,6 +72,13 @@ func appFromMap(b map[string]any) store.AppRecord {
 	rec.WorkspaceRoot, _ = b["workspace_root"].(string)
 	rec.RepoURL, _ = b["repo_url"].(string)
 	rec.GrokSandbox, _ = b["grok_sandbox"].(string)
+	rec.AgentToolchain, _ = b["agent_toolchain"].(string)
+	if v, ok := b["allow_simulator_writes"].(bool); ok {
+		rec.AllowSimulatorWrites = v
+	}
+	if raw, ok := b["verify_commands"]; ok {
+		rec.VerifyCommands = parseVerifyCommands(raw)
+	}
 	rec.BaseRemote, _ = b["base_remote"].(string)
 	rec.BaseBranch, _ = b["base_branch"].(string)
 	if v, ok := b["default"].(bool); ok {
@@ -83,6 +90,25 @@ func appFromMap(b map[string]any) store.AppRecord {
 		rec.RepoEntries = parseEntries(raw)
 	}
 	return rec
+}
+
+func parseVerifyCommands(raw any) []store.VerifyCommand {
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := []store.VerifyCommand{}
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		v := store.VerifyCommand{}
+		v.Repo, _ = m["repo"].(string)
+		v.Command, _ = m["command"].(string)
+		out = append(out, v)
+	}
+	return store.NormalizeVerifyCommands(out)
 }
 
 func parseEntries(raw any) []store.AppRepoEntry {
