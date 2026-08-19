@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -521,7 +522,7 @@ func (a *App) getBatches(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list, "jobs": a.Batches.List()})
 }
 
 func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
@@ -559,6 +560,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(primaries) == 0 {
 			msg := "no product repos resolved for worktrees — set defect.repos and/or app.repos + workspace_root"
+			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
 			a.Batches.MarkFailed(job.ID, rec.ID, msg)
 			a.Batches.SyncBatchAndDefects(a.Batches.GetJob(job.ID), "failed")
 			httpx.WriteError(w, http.StatusBadRequest, msg)
@@ -567,6 +569,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 		root := filepath.Join(a.Roots.DataRoot, "batch-jobs", job.ID, "worktrees")
 		wts, err := gitpkg.CreateBatchWorktrees(rec.ID, root, primaries)
 		if err != nil {
+			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
 			a.Batches.MarkFailed(job.ID, rec.ID, err.Error())
 			a.Batches.SyncBatchAndDefects(a.Batches.GetJob(job.ID), "failed")
 			httpx.WriteError(w, http.StatusBadRequest, err.Error())
@@ -574,6 +577,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(wts) == 0 {
 			msg := "no worktrees — refusing Grok spawn"
+			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
 			a.Batches.MarkFailed(job.ID, rec.ID, msg)
 			a.Batches.SyncBatchAndDefects(a.Batches.GetJob(job.ID), "failed")
 			httpx.WriteError(w, http.StatusBadRequest, msg)
@@ -612,6 +616,75 @@ func (a *App) getBatchJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j})
+}
+
+func (a *App) getBatchJobDiff(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	repo := r.PathValue("repo")
+	j := a.Batches.GetJob(id)
+	if j == nil {
+		httpx.WriteError(w, http.StatusNotFound, "not found")
+		return
+	}
+	var wt *gitpkg.WorktreeBinding
+	for i := range j.Worktrees {
+		if j.Worktrees[i].Repo == repo {
+			wt = &j.Worktrees[i]
+			break
+		}
+	}
+	if wt == nil {
+		httpx.WriteError(w, http.StatusNotFound, `no worktree "`+repo+`" on this job`)
+		return
+	}
+	var baseSha string
+	if j.DiffHygiene != nil {
+		for _, row := range j.DiffHygiene.Repos {
+			if row.Repo == repo {
+				baseSha = row.BaseSha
+				break
+			}
+		}
+	}
+	if baseSha == "" {
+		httpx.WriteError(w, http.StatusConflict, "no diff baseline recorded for this job")
+		return
+	}
+	if _, err := os.Stat(wt.WorktreeAbs); err != nil {
+		httpx.WriteError(w, http.StatusGone, "worktree is gone: "+wt.WorktreeAbs)
+		return
+	}
+	kind := "reflow"
+	if r.URL.Query().Get("kind") == "all" {
+		kind = "all"
+	}
+	limit := 50
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n != 0 {
+			limit = n
+		}
+	}
+	if limit < 1 {
+		limit = 1
+	} else if limit > 200 {
+		limit = 200
+	}
+	hunks, total, truncated, err := jobs.CollectHunks(wt.WorktreeAbs, baseSha, kind, limit)
+	if err != nil {
+		if err.Error() == "invalid diff baseline" {
+			httpx.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"repo":      repo,
+		"kind":      kind,
+		"hunks":     hunks,
+		"total":     total,
+		"truncated": truncated,
+	})
 }
 
 func (a *App) deleteBatchJob(w http.ResponseWriter, r *http.Request) {

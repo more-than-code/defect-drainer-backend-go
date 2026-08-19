@@ -2,6 +2,7 @@ package git
 
 import (
 	"encoding/json"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -21,6 +22,8 @@ type PRResult struct {
 	Base      string `json:"base,omitempty"`
 	Branch    string `json:"branch,omitempty"`
 	Error     string `json:"error,omitempty"`
+	Commits   int    `json:"commits,omitempty"`
+	GhError   string `json:"ghError,omitempty"`
 }
 
 // GhBin is GH_BIN or "gh" (tests inject a fake at GH_BIN).
@@ -39,6 +42,29 @@ func ghCmd(cwd string, args ...string) *exec.Cmd {
 
 func nowIso() string {
 	return time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// AcceptPRURL returns s when it is a usable `gh pr view` target: https
+// with a non-empty host, and not a leading-dash flag injection. Empty
+// otherwise. Hydrated prs[].url is untrusted — call this on load too.
+func AcceptPRURL(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.HasPrefix(s, "-") {
+		return ""
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return ""
+	}
+	return s
+}
+
+func createdPRURL(raw []byte) string {
+	fields := strings.Fields(strings.TrimSpace(string(raw)))
+	if len(fields) == 0 {
+		return ""
+	}
+	return AcceptPRURL(fields[len(fields)-1])
 }
 
 func mapGhState(s string) string {
@@ -69,7 +95,12 @@ func CreatePRsForWorktrees(bindings []WorktreeBinding, batchID, title string) []
 			continue
 		}
 		ref, _, _ := ResolveBaseRef(b.PrimaryAbs, "origin", "main")
-		if !HasCommitsVsBase(b.WorktreeAbs, ref) && !HasCommitsVsBase(b.WorktreeAbs, branch) {
+		commits := countCommits(b.WorktreeAbs, ref)
+		if commits == 0 {
+			commits = countCommits(b.WorktreeAbs, branch)
+		}
+		entry.Commits = commits
+		if commits == 0 && !HasCommitsVsBase(b.WorktreeAbs, ref) && !HasCommitsVsBase(b.WorktreeAbs, branch) {
 			entry.Status = "skipped"
 			entry.Error = "no commits ahead of base"
 			out = append(out, entry)
@@ -83,17 +114,20 @@ func CreatePRsForWorktrees(bindings []WorktreeBinding, batchID, title string) []
 				Number int    `json:"number"`
 				State  string `json:"state"`
 			}
-			if json.Unmarshal(raw, &list) == nil && len(list) > 0 && list[0].URL != "" {
-				entry.Status = "existing"
-				entry.URL = list[0].URL
-				entry.Number = list[0].Number
-				entry.GhState = mapGhState(list[0].State)
-				if entry.GhState == "" {
-					entry.GhState = "open"
+			if json.Unmarshal(raw, &list) == nil && len(list) > 0 {
+				u := AcceptPRURL(list[0].URL)
+				if u != "" || list[0].Number != 0 {
+					entry.Status = "existing"
+					entry.URL = u
+					entry.Number = list[0].Number
+					entry.GhState = mapGhState(list[0].State)
+					if entry.GhState == "" {
+						entry.GhState = "open"
+					}
+					entry.CheckedAt = nowIso()
+					out = append(out, entry)
+					continue
 				}
-				entry.CheckedAt = nowIso()
-				out = append(out, entry)
-				continue
 			}
 		}
 		raw, err := ghCmd(b.WorktreeAbs, "pr", "create", "--base", branch, "--head", b.Branch, "--title", title, "--body", "Batch "+batchID).CombinedOutput()
@@ -108,13 +142,17 @@ func CreatePRsForWorktrees(bindings []WorktreeBinding, batchID, title string) []
 			out = append(out, entry)
 			continue
 		}
-		lines := strings.Fields(strings.TrimSpace(string(raw)))
-		url := ""
-		if len(lines) > 0 {
-			url = lines[len(lines)-1]
+		url := createdPRURL(raw)
+		if url == "" {
+			entry.Error = "gh pr create returned a non-https URL"
+			out = append(out, entry)
+			continue
 		}
 		entry.Status = "created"
 		entry.URL = url
+		if entry.Number == 0 {
+			entry.Number = prNumberFromURL(url)
+		}
 		entry.GhState = "open"
 		entry.CheckedAt = nowIso()
 		out = append(out, entry)
@@ -131,7 +169,8 @@ func RefreshPRStatuses(prs []PRResult, worktrees []WorktreeBinding) []PRResult {
 	out := make([]PRResult, 0, len(prs))
 	for _, prev := range prs {
 		entry := prev
-		trackable := entry.URL != "" || entry.Status == "created" || entry.Status == "existing"
+		entry.URL = AcceptPRURL(entry.URL)
+		trackable := entry.URL != "" || entry.Number != 0 || entry.Status == "created" || entry.Status == "existing"
 		if !trackable {
 			out = append(out, entry)
 			continue
@@ -146,8 +185,10 @@ func RefreshPRStatuses(prs []PRResult, worktrees []WorktreeBinding) []PRResult {
 		}
 		var raw []byte
 		var err error
-		if entry.URL != "" {
-			raw, err = ghCmd(cwd, "pr", "view", entry.URL, "--json", "state,mergedAt,number,url").Output()
+		if entry.Number != 0 {
+			raw, err = ghCmd(cwd, "pr", "view", strconv.Itoa(entry.Number), "--json", "state,mergedAt,number,url").Output()
+		} else if u := AcceptPRURL(entry.URL); u != "" {
+			raw, err = ghCmd(cwd, "pr", "view", u, "--json", "state,mergedAt,number,url").Output()
 		} else if entry.Branch != "" {
 			raw, err = ghCmd(cwd, "pr", "list", "--head", entry.Branch, "--base", orMain(entry.Base), "--state", "all", "--json", "state,mergedAt,number,url", "--limit", "1").Output()
 		} else {
@@ -155,7 +196,11 @@ func RefreshPRStatuses(prs []PRResult, worktrees []WorktreeBinding) []PRResult {
 			continue
 		}
 		if err != nil {
-			entry.Error = err.Error()
+			msg := err.Error()
+			if len(msg) > 500 {
+				msg = msg[:500]
+			}
+			entry.GhError = msg
 			entry.CheckedAt = nowIso()
 			out = append(out, entry)
 			continue
@@ -176,6 +221,11 @@ func RefreshPRStatuses(prs []PRResult, worktrees []WorktreeBinding) []PRResult {
 			}
 			if json.Unmarshal(raw, &list) == nil && len(list) > 0 {
 				view.State, view.MergedAt, view.Number, view.URL = list[0].State, list[0].MergedAt, list[0].Number, list[0].URL
+			} else if entry.Branch != "" && entry.URL == "" {
+				entry.GhError = "no PR found for branch"
+				entry.CheckedAt = nowIso()
+				out = append(out, entry)
+				continue
 			}
 		} else {
 			_ = json.Unmarshal(raw, &view)
@@ -184,14 +234,16 @@ func RefreshPRStatuses(prs []PRResult, worktrees []WorktreeBinding) []PRResult {
 			entry.GhState = st
 		}
 		entry.MergedAt = view.MergedAt
-		if view.URL != "" {
-			entry.URL = view.URL
+		if u := AcceptPRURL(view.URL); u != "" {
+			entry.URL = u
+		} else if entry.URL != "" && AcceptPRURL(entry.URL) == "" {
+			entry.URL = ""
 		}
 		if view.Number != 0 {
 			entry.Number = view.Number
 		}
 		entry.CheckedAt = nowIso()
-		entry.Error = ""
+		entry.GhError = ""
 		out = append(out, entry)
 	}
 	return out
@@ -202,6 +254,26 @@ func orMain(s string) string {
 		return "main"
 	}
 	return s
+}
+
+func countCommits(worktreeAbs, baseRef string) int {
+	if baseRef == "" {
+		return 0
+	}
+	out, err := gitCOut(worktreeAbs, "rev-list", "--count", baseRef+"..HEAD")
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(out))
+	return n
+}
+
+func prNumberFromURL(url string) int {
+	url = strings.TrimRight(url, "/")
+	if i := strings.LastIndex(url, "/"); i >= 0 {
+		return ParsePRNumber(url[i+1:])
+	}
+	return 0
 }
 
 // ParsePRNumber is a tiny helper for tests.
