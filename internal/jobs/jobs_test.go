@@ -96,10 +96,22 @@ func TestJobExtraUnknownFieldsSurviveRoundTrip(t *testing.T) {
 	if got["status"] != "completed" {
 		t.Fatalf("status %v", got["status"])
 	}
-	for _, key := range []string{"verification", "baseline", "diffHygiene", "batchPath", "repo_urls"} {
+	for _, key := range []string{"batchPath", "repo_urls"} {
 		if !reflect.DeepEqual(got[key], src[key]) {
 			t.Fatalf("%s not value-identical:\nwant %#v\ngot  %#v", key, src[key], got[key])
 		}
+	}
+	v, _ := got["verification"].(map[string]any)
+	if v["ran"] != true {
+		t.Fatalf("first-class verification lost: %#v", got["verification"])
+	}
+	bmap, _ := got["baseline"].(map[string]any)
+	if bmap["ran"] != true {
+		t.Fatalf("first-class baseline lost: %#v", got["baseline"])
+	}
+	dmap, _ := got["diffHygiene"].(map[string]any)
+	if dmap["noisy"] != true {
+		t.Fatalf("first-class diffHygiene lost: %#v", got["diffHygiene"])
 	}
 }
 
@@ -1407,5 +1419,81 @@ func TestPersistLiveReturnsWriteError(t *testing.T) {
 	}
 	if err := b.persistLive(j.ID); err == nil {
 		t.Fatal("persistLive swallowed write error")
+	}
+}
+
+func TestHarvestFailingVerdictDoesNotResolveEvenWithPNG(t *testing.T) {
+	st, data, _ := testStore(t)
+	br := NewBatchRunner(st, data)
+	id := "DEF-20260819-verdict-png-0001"
+	writeInProgressDefect(t, st, id)
+	job := &Job{
+		ID: "bjob_verdict", Kind: "batch", Status: "completed",
+		BatchID: "BATCH-20260819-v", AppID: store.SeededTutoredWebappAppID,
+		DefectIDs: []string{id},
+		Baseline: &VerificationRun{
+			Ran: true,
+			Results: []VerifyResult{
+				{Repo: "demo", Command: "true", Ok: true, ExitCode: intPtr(0)},
+			},
+		},
+	}
+	br.jobs[job.ID] = job
+	handoff := filepath.Join(data, "batch-jobs", job.ID)
+	imgDir := filepath.Join(handoff, "fix-evidence", id)
+	if err := os.MkdirAll(imgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(imgDir, "fix-01.png"), []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := &VerificationRun{
+		Ran: true,
+		Results: []VerifyResult{
+			{Repo: "demo", Command: "true", Ok: false, ExitCode: intPtr(1)},
+		},
+	}
+	br.harvestFixEvidence(job, handoff, &HarvestOpts{Verification: run})
+	got, err := st.Get(id)
+	if err != nil || got == nil || got.Status == "resolved" {
+		t.Fatalf("failing verdict must not resolve, got %+v %v", got, err)
+	}
+	if len(got.FixEvidence) == 0 {
+		t.Fatal("evidence should still be imported")
+	}
+	found := false
+	for _, line := range job.Log {
+		if strings.Contains(line, "NOT resolved") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing NOT resolved log: %#v", job.Log)
+	}
+}
+
+func TestHarvestNilVerificationStillResolvesOnPNG(t *testing.T) {
+	st, data, _ := testStore(t)
+	br := NewBatchRunner(st, data)
+	id := "DEF-20260819-nilver-png-0001"
+	writeInProgressDefect(t, st, id)
+	job := &Job{
+		ID: "bjob_nilver", Kind: "batch", Status: "completed",
+		BatchID: "BATCH-20260819-nv", AppID: store.SeededTutoredWebappAppID,
+		DefectIDs: []string{id},
+	}
+	br.jobs[job.ID] = job
+	handoff := filepath.Join(data, "batch-jobs", job.ID)
+	imgDir := filepath.Join(handoff, "fix-evidence", id)
+	if err := os.MkdirAll(imgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(imgDir, "fix-01.png"), []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	br.harvestFixEvidence(job, handoff, nil)
+	got, err := st.Get(id)
+	if err != nil || got == nil || got.Status != "resolved" {
+		t.Fatalf("nil verification should still resolve on PNG, got %+v %v", got, err)
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/joe/defect-drainer-go/internal/env"
 )
 
 // normalizeSandbox maps empty / restrict / restricted / anything else → strict.
@@ -168,12 +170,126 @@ func (f *lineForwarder) Flush() {
 	<-f.done
 }
 
+// VerifySpec is one operator verification command, for the spawn prompt only.
+type VerifySpec struct {
+	Repo    string
+	Command string
+}
+
+// CodingAgentOpts is extra spawn wiring (toolchain PATH, job-scoped sandbox
+// profile, prompt notes). Nil is a no-op.
+type CodingAgentOpts struct {
+	ExtraEnv       map[string]string
+	SandboxProfile string
+	ToolchainNotes []string
+	VerifyCommands []VerifySpec
+	AlreadyFailing []string
+}
+
+func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, worktrees []WorktreeBinding, opts *CodingAgentOpts) string {
+	wtLines := make([]string, 0, len(worktrees))
+	if len(worktrees) == 0 {
+		wtLines = []string{"- (none — do not edit product code)"}
+	} else {
+		for _, w := range worktrees {
+			wtLines = append(wtLines, "- "+w.Repo+": EDIT ONLY "+w.WorktreeAbs+" (branch "+w.Branch+"); NEVER "+w.PrimaryAbs)
+		}
+	}
+	var sandboxNotes []string
+	if sandbox == "workspace" {
+		sandboxNotes = []string{
+			"SANDBOX: --sandbox workspace (App Settings).",
+			"- Read: host filesystem (iOS Simulator, Xcode, simctl data allowed).",
+			"- Write: cwd (" + handoffAbs + "), ~/.grok/, and temp only.",
+			"- Product code: edit only under cwd/worktrees/…",
+			"- Visual check / fix screenshots: capture under cwd/fix-evidence/<DEF-id>/fix-01.png (handoff-writable).",
+			"- Inventory root " + defectsRoot + " is readable — open report + **historical fix evidence** paths listed in BRIEF.md.",
+		}
+	} else {
+		sandboxNotes = []string{
+			"SANDBOX: --sandbox strict / restrict (App Settings).",
+			"- Read: cwd + system paths only (no ~/Library Simulator data).",
+			"- Write: cwd (" + handoffAbs + "), ~/.grok/, and temp.",
+			"- Product code: edit only under cwd/worktrees/…",
+			"- Historical fix evidence may be unreadable under strict if paths are outside cwd — prefer workspace sandbox for visual history.",
+			"- Inventory updates under " + defectsRoot + " may be blocked; write new proof to handoff fix-evidence/.",
+		}
+	}
+	parts := []string{
+		"Batch defect fix session for " + batchID + ".",
+		"Handoff directory (cwd): " + handoffAbs,
+		"Inventory root: " + defectsRoot,
+		"",
+	}
+	parts = append(parts, sandboxNotes...)
+	if opts != nil && len(opts.ToolchainNotes) > 0 {
+		parts = append(parts, "")
+		parts = append(parts, opts.ToolchainNotes...)
+	}
+	if opts != nil && len(opts.VerifyCommands) > 0 {
+		parts = append(parts, "",
+			"VERIFICATION (run by Defect Drainer after you exit — not by you, and not editable):",
+		)
+		for _, v := range opts.VerifyCommands {
+			parts = append(parts, "- "+v.Repo+": "+v.Command)
+		}
+		parts = append(parts,
+			"- A command you BREAK blocks the resolve, however good your screenshots are.",
+			"- Run them yourself in the worktree before claiming DONE; fix what you broke.",
+			"- Do not report test results you did not actually observe.",
+		)
+		if len(opts.AlreadyFailing) > 0 {
+			parts = append(parts,
+				"- ALREADY FAILING before you started (measured, not your doing —",
+				"  do not chase these unless the defect is about them):",
+			)
+			for _, f := range opts.AlreadyFailing {
+				parts = append(parts, "    · "+f)
+			}
+		} else {
+			parts = append(parts, "- All of them passed before you started, so any failure after is yours.")
+		}
+	}
+	parts = append(parts, "",
+		"WORKTREE ENFORCEMENT (mandatory):",
+	)
+	parts = append(parts, wtLines...)
+	parts = append(parts,
+		"- Product edits outside listed worktree paths are forbidden.",
+		"- Do not checkout branches on primary trees. Do not run git commands in primaryAbs.",
+		"- READ each worktree's own contract file (AGENTS.md / CLAUDE.md — BRIEF.md lists",
+		"  the exact paths) BEFORE editing it. They define that repo's mandatory gates,",
+		"  skills and conventions; where stricter than this brief, they win. Follow its",
+		"  house style — do not reformat code the fix does not need to touch.",
+		"",
+		"Read BRIEF.md first. For each defect it lists:",
+		"- report evidence (bug as reported)",
+		"- historical fix evidence (prior proof on the defect SSOT — use as context / regression baseline)",
+		"- what to deliver this run under handoff fix-evidence/ and fix-notes/",
+		"",
+		"TASK:",
+		"1. For each defect: read report + historical fix evidence from BRIEF paths; implement fixes only under worktree paths.",
+		"2. Verify (tests / smoke / visual) inside the worktree checkout; compare to historical fix shots when present.",
+		"3. REQUIRED **new** deliverables under this cwd (backend harvests onto the defect):",
+		"   - fix-evidence/<DEF-id>/fix-01.png (and more images as needed)",
+		"   - fix-notes/<DEF-id>.md  (what changed + how verified; note relation to prior fix if any)",
+		"   - fix-notes must answer EACH acceptance criterion listed for that defect in BRIEF.md.",
+		"     Those criteria are the definition of fixed — not your own reading of the title.",
+		"     If one cannot be met, say so explicitly instead of omitting it.",
+		"4. Visual check when sandbox=workspace: Simulator / app screenshots into fix-evidence/.",
+		"5. Do not claim DONE without those **handoff** files for each fixed defect (historical inventory files alone are not enough for this run).",
+		"6. Reply: DONE "+batchID,
+	)
+	return strings.Join(parts, "\n")
+}
+
 // StartCodingAgent execs the resolved bin. Empty worktrees refuse spawn.
 // sandbox is the app grok_sandbox setting; empty falls back to strict.
-// onStdout / onStderr receive complete lines (stdout info, stderr warn);
+// opts may carry toolchain env, a job-scoped sandbox profile name, and prompt
+// notes. onStdout / onStderr receive complete lines (stdout info, stderr warn);
 // both streams are still appended to handoff/agent.log. flush drains any
 // trailing partial line and closes the log file — call it after Wait.
-func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []WorktreeBinding, sandbox string, onStdout, onStderr func(string)) (*exec.Cmd, func(), error) {
+func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []WorktreeBinding, sandbox string, onStdout, onStderr func(string), opts *CodingAgentOpts) (*exec.Cmd, func(), error) {
 	if len(worktrees) == 0 {
 		return nil, nil, fmt.Errorf("refusing to spawn agent batch fix without worktrees")
 	}
@@ -182,19 +298,14 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		return nil, nil, fmt.Errorf("coding agent binary not found")
 	}
 	sandbox = normalizeSandbox(sandbox)
-	var lines []string
-	for _, w := range worktrees {
-		lines = append(lines, "- "+w.Repo+": EDIT ONLY "+w.WorktreeAbs)
+	// A job-scoped profile extends the built-in one; the prompt still describes
+	// the base profile's rules, which the custom profile only widens.
+	sandboxArg := sandbox
+	if opts != nil && opts.SandboxProfile != "" {
+		sandboxArg = opts.SandboxProfile
 	}
-	prompt := strings.Join([]string{
-		"Batch defect fix session for " + batchID + ".",
-		"Handoff directory (cwd): " + handoffAbs,
-		"Inventory root: " + defectsRoot,
-		"WORKTREE ENFORCEMENT:",
-		strings.Join(lines, "\n"),
-		"Read BRIEF.md first. Reply: DONE " + batchID,
-	}, "\n")
-	maxTurns := os.Getenv("DEFECT_DRAINER_GROK_BATCH_MAX_TURNS")
+	prompt := buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox, worktrees, opts)
+	maxTurns := env.EnvDrainer("GROK_BATCH_MAX_TURNS")
 	if maxTurns == "" {
 		maxTurns = os.Getenv("GROK_BATCH_MAX_TURNS")
 	}
@@ -204,11 +315,17 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	args := []string{
 		"-p", prompt,
 		"--cwd", handoffAbs,
-		"--sandbox", sandbox,
+		"--sandbox", sandboxArg,
 		"--always-approve",
 		"--max-turns", maxTurns,
 		"--output-format", "plain",
 		"--verbatim",
+	}
+	if env.EnvDrainerFlag("GROK_BYPASS_PERMISSIONS") {
+		args = append(args, "--permission-mode", "bypassPermissions")
+	}
+	if tools := strings.TrimSpace(env.EnvDrainer("GROK_TOOLS")); tools != "" {
+		args = append(args, "--tools", tools)
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = handoffAbs
@@ -218,9 +335,17 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	}
 	cmd.Env = append(os.Environ(),
 		"CI=1",
-		"GROK_SANDBOX="+sandbox,
-		"DEFECT_DRAINER_WORKTREES="+strings.Join(wtPaths, ":"),
+		"GROK_SANDBOX="+sandboxArg,
 	)
+	if opts != nil {
+		for k, v := range opts.ExtraEnv {
+			if k == "" {
+				continue
+			}
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
+	cmd.Env = append(cmd.Env, "DEFECT_DRAINER_WORKTREES="+strings.Join(wtPaths, ":"))
 	outFwd := newLineForwarder(onStdout)
 	errFwd := newLineForwarder(onStderr)
 	logf, err := os.OpenFile(handoffAbs+"/agent.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)

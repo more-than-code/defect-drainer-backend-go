@@ -31,7 +31,7 @@ func TestStartCodingAgentHonoursSandbox(t *testing.T) {
 	handoff := t.TempDir()
 	wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
 
-	cmd, flush, err := StartCodingAgent(handoff, "BATCH-1", t.TempDir(), wts, "workspace", nil, nil)
+	cmd, flush, err := StartCodingAgent(handoff, "BATCH-1", t.TempDir(), wts, "workspace", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestStartCodingAgentHonoursSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("GROK_BUILD_BIN", bin2)
-	cmd, flush, err = StartCodingAgent(t.TempDir(), "BATCH-2", t.TempDir(), wts, "", nil, nil)
+	cmd, flush, err = StartCodingAgent(t.TempDir(), "BATCH-2", t.TempDir(), wts, "", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestAgentLogTeeIsCapped(t *testing.T) {
 	t.Setenv("GROK_BUILD_BIN", bin)
 	handoff := t.TempDir()
 	wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
-	cmd, flush, err := StartCodingAgent(handoff, "BATCH-cap", t.TempDir(), wts, "strict", nil, nil)
+	cmd, flush, err := StartCodingAgent(handoff, "BATCH-cap", t.TempDir(), wts, "strict", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,5 +190,52 @@ func TestAgentLogTeeIsCapped(t *testing.T) {
 	}
 	if st.Size() == 0 {
 		t.Fatal("agent.log empty — tee not wired")
+	}
+}
+
+func TestStartCodingAgentExtraEnvAndSandboxProfile(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "args.txt")
+	bin := filepath.Join(t.TempDir(), "fake-grok")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + out + "\"\nprintf 'GROK_SANDBOX=%s\\n' \"$GROK_SANDBOX\" >> \"" + out + "\"\nprintf 'PATH=%s\\n' \"$PATH\" >> \"" + out + "\"\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_BUILD_BIN", bin)
+	handoff := t.TempDir()
+	wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
+	cmd, flush, err := StartCodingAgent(handoff, "BATCH-sim", t.TempDir(), wts, "workspace", nil, nil, &CodingAgentOpts{
+		ExtraEnv:       map[string]string{"PATH": "/handoff/.tooling/bin:/bin"},
+		SandboxProfile: "dd-simulator",
+		VerifyCommands: []VerifySpec{{Repo: "demo", Command: "true"}},
+		AlreadyFailing: []string{"demo: true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if flush != nil {
+		flush()
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+	if argvFlagValue(s, "--sandbox") != "dd-simulator" {
+		t.Fatalf("sandbox argv want dd-simulator, got %q in:\n%s", argvFlagValue(s, "--sandbox"), s)
+	}
+	if !strings.Contains(s, "GROK_SANDBOX=dd-simulator") {
+		t.Fatalf("GROK_SANDBOX: %s", s)
+	}
+	if !strings.Contains(s, "PATH=/handoff/.tooling/bin:/bin") {
+		t.Fatalf("extra PATH not merged: %s", s)
+	}
+	if !strings.Contains(s, "VERIFICATION (run by Defect Drainer") {
+		t.Fatalf("prompt missing VERIFICATION block:\n%s", s)
+	}
+	if !strings.Contains(s, "SANDBOX: --sandbox workspace") {
+		t.Fatalf("prompt should describe the base profile:\n%s", s)
 	}
 }

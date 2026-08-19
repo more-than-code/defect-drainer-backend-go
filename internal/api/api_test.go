@@ -747,7 +747,7 @@ exit 1
 }
 
 func TestSpawnRefusesEmptyWorktrees(t *testing.T) {
-	_, _, err := git.StartCodingAgent(t.TempDir(), "BATCH-x", t.TempDir(), nil, "", nil, nil)
+	_, _, err := git.StartCodingAgent(t.TempDir(), "BATCH-x", t.TempDir(), nil, "", nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "without worktrees") {
 		t.Fatalf("got %v", err)
 	}
@@ -995,5 +995,170 @@ func TestFailedSpawnErrorText(t *testing.T) {
 	}
 	if !strings.Contains(errStr, "code=1") {
 		t.Fatalf("job.error should report exit 1: %q", errStr)
+	}
+}
+
+func writeBatchJobJSON(t *testing.T, data, id string, job map[string]any) {
+	t.Helper()
+	dir := filepath.Join(data, "batch-jobs", id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.MarshalIndent(job, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "job.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %s", args, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestBatchJobDiffEndpoint(t *testing.T) {
+	defects := t.TempDir()
+	data := t.TempDir()
+	wt := t.TempDir()
+	initGitRepo(t, wt)
+	if err := os.WriteFile(filepath.Join(wt, "a.dart"), []byte("foo\n  bar\nbaz\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "b.dart"), []byte("oldToken\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, wt, "add", "a.dart", "b.dart")
+	gitOut(t, wt, "commit", "-m", "base")
+	baseSha := gitOut(t, wt, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(wt, "a.dart"), []byte("foo bar baz\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "b.dart"), []byte("newToken\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wtBinding := []map[string]any{{
+		"repo": "demo", "worktreeAbs": wt, "primaryAbs": wt, "branch": "main",
+	}}
+	writeBatchJobJSON(t, data, "bjob_diffok", map[string]any{
+		"jobId": "bjob_diffok", "status": "completed", "kind": "batch",
+		"worktrees": wtBinding,
+		"diffHygiene": map[string]any{
+			"noisy": false,
+			"repos": []map[string]any{{"repo": "demo", "baseSha": baseSha}},
+		},
+	})
+	writeBatchJobJSON(t, data, "bjob_diff409", map[string]any{
+		"jobId": "bjob_diff409", "status": "completed", "kind": "batch",
+		"worktrees":   wtBinding,
+		"diffHygiene": map[string]any{"noisy": false, "repos": []map[string]any{{"repo": "demo"}}},
+	})
+	writeBatchJobJSON(t, data, "bjob_diff410", map[string]any{
+		"jobId": "bjob_diff410", "status": "completed", "kind": "batch",
+		"worktrees": []map[string]any{{
+			"repo": "demo", "worktreeAbs": filepath.Join(t.TempDir(), "gone"), "primaryAbs": wt, "branch": "main",
+		}},
+		"diffHygiene": map[string]any{
+			"repos": []map[string]any{{"repo": "demo", "baseSha": baseSha}},
+		},
+	})
+	writeBatchJobJSON(t, data, "bjob_diffnowt", map[string]any{
+		"jobId": "bjob_diffnowt", "status": "completed", "kind": "batch",
+		"worktrees": wtBinding,
+		"diffHygiene": map[string]any{
+			"repos": []map[string]any{{"repo": "demo", "baseSha": baseSha}},
+		},
+	})
+
+	app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, SkipMigrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.Close)
+
+	notFound := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/no-such/diff/demo", nil)
+	if notFound.Code != 404 || !strings.Contains(notFound.Body.String(), `"not found"`) {
+		t.Fatalf("unknown job: %d %s", notFound.Code, notFound.Body)
+	}
+	noWT := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_diffnowt/diff/other", nil)
+	if noWT.Code != 404 || !strings.Contains(noWT.Body.String(), `no worktree`) || !strings.Contains(noWT.Body.String(), "other") {
+		t.Fatalf("no worktree: %d %s", noWT.Code, noWT.Body)
+	}
+	conflict := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_diff409/diff/demo", nil)
+	if conflict.Code != 409 || !strings.Contains(conflict.Body.String(), "no diff baseline recorded") {
+		t.Fatalf("409: %d %s", conflict.Code, conflict.Body)
+	}
+	gone := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_diff410/diff/demo", nil)
+	if gone.Code != 410 || !strings.Contains(gone.Body.String(), "worktree is gone:") {
+		t.Fatalf("410: %d %s", gone.Code, gone.Body)
+	}
+
+	okReflow := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_diffok/diff/demo", nil)
+	if okReflow.Code != 200 {
+		t.Fatalf("200 reflow: %d %s", okReflow.Code, okReflow.Body)
+	}
+	var reflowBody struct {
+		Repo  string `json:"repo"`
+		Kind  string `json:"kind"`
+		Hunks []struct {
+			File   string `json:"file"`
+			Reflow bool   `json:"reflow"`
+		} `json:"hunks"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(okReflow.Body.Bytes(), &reflowBody); err != nil {
+		t.Fatal(err)
+	}
+	if reflowBody.Repo != "demo" || reflowBody.Kind != "reflow" {
+		t.Fatalf("body %+v", reflowBody)
+	}
+	if reflowBody.Total < 1 {
+		t.Fatalf("expected reflow hunks: %s", okReflow.Body)
+	}
+	for _, h := range reflowBody.Hunks {
+		if !h.Reflow {
+			t.Fatalf("kind=reflow returned a non-reflow hunk: %+v", h)
+		}
+	}
+
+	okAll := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_diffok/diff/demo?kind=all", nil)
+	if okAll.Code != 200 {
+		t.Fatalf("200 all: %d %s", okAll.Code, okAll.Body)
+	}
+	var allBody struct {
+		Kind  string `json:"kind"`
+		Hunks []struct {
+			Reflow bool `json:"reflow"`
+		} `json:"hunks"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(okAll.Body.Bytes(), &allBody); err != nil {
+		t.Fatal(err)
+	}
+	if allBody.Kind != "all" || allBody.Total < 2 {
+		t.Fatalf("kind=all should include token + reflow hunks: %s", okAll.Body)
+	}
+	sawReflow, sawToken := false, false
+	for _, h := range allBody.Hunks {
+		if h.Reflow {
+			sawReflow = true
+		} else {
+			sawToken = true
+		}
+	}
+	if !sawReflow || !sawToken {
+		t.Fatalf("kind=all missing both kinds: %s", okAll.Body)
 	}
 }

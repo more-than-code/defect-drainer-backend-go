@@ -2,6 +2,7 @@
 package jobs
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -26,30 +27,33 @@ import (
 
 // Job is a normalize or batch job record.
 type Job struct {
-	ID          string                `json:"jobId"`
-	Kind        string                `json:"kind,omitempty"`
-	Status      string                `json:"status"`
-	Mode        string                `json:"mode,omitempty"`
-	AppID       string                `json:"app_id,omitempty"`
-	DefectID    string                `json:"defectId,omitempty"`
-	BatchID     string                `json:"batchId,omitempty"`
-	DefectIDs   []string              `json:"defect_ids,omitempty"`
-	Repos       []string              `json:"repos,omitempty"`
-	Error       string                `json:"error,omitempty"`
-	HandoffPath string                `json:"handoffPath,omitempty"`
-	CreatedAt   string                `json:"createdAt,omitempty"`
-	UpdatedAt   string                `json:"updatedAt,omitempty"`
-	Comment     string                `json:"comment,omitempty"`
-	Reporter    string                `json:"reporter,omitempty"`
-	PRs         []PR                  `json:"prs,omitempty"`
-	Worktrees   []git.WorktreeBinding `json:"worktrees,omitempty"`
-	Log         []string              `json:"log,omitempty"`
-	Source      string                `json:"source,omitempty"`
-	DefectPath  string                `json:"defectPath,omitempty"`
-	Severity    string                `json:"severity,omitempty"`
-	Client      string                `json:"client,omitempty"`
-	Surface     string                `json:"surface,omitempty"`
-	Extra       map[string]any        `json:"-"`
+	ID           string                `json:"jobId"`
+	Kind         string                `json:"kind,omitempty"`
+	Status       string                `json:"status"`
+	Mode         string                `json:"mode,omitempty"`
+	AppID        string                `json:"app_id,omitempty"`
+	DefectID     string                `json:"defectId,omitempty"`
+	BatchID      string                `json:"batchId,omitempty"`
+	DefectIDs    []string              `json:"defect_ids,omitempty"`
+	Repos        []string              `json:"repos,omitempty"`
+	Error        string                `json:"error,omitempty"`
+	HandoffPath  string                `json:"handoffPath,omitempty"`
+	CreatedAt    string                `json:"createdAt,omitempty"`
+	UpdatedAt    string                `json:"updatedAt,omitempty"`
+	Comment      string                `json:"comment,omitempty"`
+	Reporter     string                `json:"reporter,omitempty"`
+	PRs          []PR                  `json:"prs,omitempty"`
+	Worktrees    []git.WorktreeBinding `json:"worktrees,omitempty"`
+	Verification *VerificationRun      `json:"verification,omitempty"`
+	Baseline     *VerificationRun      `json:"baseline,omitempty"`
+	DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
+	Log          []string              `json:"log,omitempty"`
+	Source       string                `json:"source,omitempty"`
+	DefectPath   string                `json:"defectPath,omitempty"`
+	Severity     string                `json:"severity,omitempty"`
+	Client       string                `json:"client,omitempty"`
+	Surface      string                `json:"surface,omitempty"`
+	Extra        map[string]any        `json:"-"`
 }
 
 // jobOwnedJSON is every key the Job struct serializes (plus legacy "id").
@@ -59,6 +63,7 @@ var jobOwnedJSON = map[string]bool{
 	"defectId": true, "batchId": true, "defect_ids": true, "repos": true,
 	"error": true, "handoffPath": true, "createdAt": true, "updatedAt": true,
 	"comment": true, "reporter": true, "prs": true, "worktrees": true,
+	"verification": true, "baseline": true, "diffHygiene": true,
 	"log": true, "source": true, "defectPath": true,
 	"severity": true, "client": true, "surface": true,
 }
@@ -112,37 +117,41 @@ func (j *Job) UnmarshalJSON(data []byte) error {
 // MarshalJSON always writes jobId (never id). Struct fields win over Extra.
 func (j Job) MarshalJSON() ([]byte, error) {
 	type wire struct {
-		ID          string                `json:"jobId"`
-		Kind        string                `json:"kind,omitempty"`
-		Status      string                `json:"status"`
-		Mode        string                `json:"mode,omitempty"`
-		AppID       string                `json:"app_id,omitempty"`
-		DefectID    string                `json:"defectId,omitempty"`
-		BatchID     string                `json:"batchId,omitempty"`
-		DefectIDs   []string              `json:"defect_ids,omitempty"`
-		Repos       []string              `json:"repos,omitempty"`
-		Error       string                `json:"error,omitempty"`
-		HandoffPath string                `json:"handoffPath,omitempty"`
-		CreatedAt   string                `json:"createdAt,omitempty"`
-		UpdatedAt   string                `json:"updatedAt,omitempty"`
-		Comment     string                `json:"comment,omitempty"`
-		Reporter    string                `json:"reporter,omitempty"`
-		PRs         []PR                  `json:"prs,omitempty"`
-		Worktrees   []git.WorktreeBinding `json:"worktrees,omitempty"`
-		Log         []string              `json:"log,omitempty"`
-		Source      string                `json:"source,omitempty"`
-		DefectPath  string                `json:"defectPath,omitempty"`
-		Severity    string                `json:"severity,omitempty"`
-		Client      string                `json:"client,omitempty"`
-		Surface     string                `json:"surface,omitempty"`
+		ID           string                `json:"jobId"`
+		Kind         string                `json:"kind,omitempty"`
+		Status       string                `json:"status"`
+		Mode         string                `json:"mode,omitempty"`
+		AppID        string                `json:"app_id,omitempty"`
+		DefectID     string                `json:"defectId,omitempty"`
+		BatchID      string                `json:"batchId,omitempty"`
+		DefectIDs    []string              `json:"defect_ids,omitempty"`
+		Repos        []string              `json:"repos,omitempty"`
+		Error        string                `json:"error,omitempty"`
+		HandoffPath  string                `json:"handoffPath,omitempty"`
+		CreatedAt    string                `json:"createdAt,omitempty"`
+		UpdatedAt    string                `json:"updatedAt,omitempty"`
+		Comment      string                `json:"comment,omitempty"`
+		Reporter     string                `json:"reporter,omitempty"`
+		PRs          []PR                  `json:"prs,omitempty"`
+		Worktrees    []git.WorktreeBinding `json:"worktrees,omitempty"`
+		Verification *VerificationRun      `json:"verification,omitempty"`
+		Baseline     *VerificationRun      `json:"baseline,omitempty"`
+		DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
+		Log          []string              `json:"log,omitempty"`
+		Source       string                `json:"source,omitempty"`
+		DefectPath   string                `json:"defectPath,omitempty"`
+		Severity     string                `json:"severity,omitempty"`
+		Client       string                `json:"client,omitempty"`
+		Surface      string                `json:"surface,omitempty"`
 	}
 	b, err := json.Marshal(wire{
 		ID: j.ID, Kind: j.Kind, Status: j.Status, Mode: j.Mode, AppID: j.AppID,
 		DefectID: j.DefectID, BatchID: j.BatchID, DefectIDs: j.DefectIDs,
 		Repos: j.Repos, Error: j.Error, HandoffPath: j.HandoffPath,
 		CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt, Comment: j.Comment,
-		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees, Log: j.Log,
-		Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
+		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees,
+		Verification: j.Verification, Baseline: j.Baseline, DiffHygiene: j.DiffHygiene,
+		Log: j.Log, Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
 		Client: j.Client, Surface: j.Surface,
 	})
 	if err != nil {
@@ -348,6 +357,27 @@ func cloneJob(j *Job) *Job {
 	}
 	if j.Worktrees != nil {
 		c.Worktrees = append([]git.WorktreeBinding(nil), j.Worktrees...)
+	}
+	if j.Verification != nil {
+		v := *j.Verification
+		if j.Verification.Results != nil {
+			v.Results = append([]VerifyResult(nil), j.Verification.Results...)
+		}
+		c.Verification = &v
+	}
+	if j.Baseline != nil {
+		v := *j.Baseline
+		if j.Baseline.Results != nil {
+			v.Results = append([]VerifyResult(nil), j.Baseline.Results...)
+		}
+		c.Baseline = &v
+	}
+	if j.DiffHygiene != nil {
+		d := *j.DiffHygiene
+		if j.DiffHygiene.Repos != nil {
+			d.Repos = append([]RepoDiffHygiene(nil), j.DiffHygiene.Repos...)
+		}
+		c.DiffHygiene = &d
 	}
 	if j.Extra != nil {
 		c.Extra = cloneMap(j.Extra)
@@ -679,20 +709,22 @@ type BatchRunner struct {
 	mu        sync.Mutex
 	persistMu sync.Mutex
 	persist   map[string]*sync.Mutex
-	starting  map[string]chan struct{}
-	store     *store.Store
-	dataRoot  string
-	jobs      map[string]*Job
-	procs     map[string]*spawnedProc
+	starting     map[string]chan struct{}
+	verifyCancel map[string]context.CancelFunc
+	store        *store.Store
+	dataRoot     string
+	jobs         map[string]*Job
+	procs        map[string]*spawnedProc
 }
 
 // NewBatchRunner hydrates batch-jobs; running/queued → failed + interrupted.
 func NewBatchRunner(st *store.Store, dataRoot string) *BatchRunner {
 	b := &BatchRunner{
 		store: st, dataRoot: dataRoot,
-		jobs:    map[string]*Job{},
-		procs:   map[string]*spawnedProc{},
-		persist: map[string]*sync.Mutex{},
+		jobs:         map[string]*Job{},
+		procs:        map[string]*spawnedProc{},
+		persist:      map[string]*sync.Mutex{},
+		verifyCancel: map[string]context.CancelFunc{},
 	}
 	_ = os.MkdirAll(paths.BatchJobsDir(dataRoot), 0o755)
 	b.hydrate()
@@ -946,7 +978,12 @@ func (b *BatchRunner) DeleteJob(id string) error {
 	}
 	delete(b.jobs, id)
 	delete(b.procs, id)
+	c := b.verifyCancel[id]
+	delete(b.verifyCancel, id)
 	b.mu.Unlock()
+	if c != nil {
+		c()
+	}
 	if slot != nil && slot.cmd != nil && slot.cmd.Process != nil {
 		_ = slot.cmd.Process.Kill()
 	}
@@ -967,6 +1004,25 @@ func (b *BatchRunner) DeleteJob(id string) error {
 	delete(b.persist, id)
 	b.persistMu.Unlock()
 	return err
+}
+
+func (b *BatchRunner) setVerifyCancel(id string, cancel context.CancelFunc) {
+	b.mu.Lock()
+	if b.verifyCancel == nil {
+		b.verifyCancel = map[string]context.CancelFunc{}
+	}
+	b.verifyCancel[id] = cancel
+	b.mu.Unlock()
+}
+
+func (b *BatchRunner) callVerifyCancel(id string) {
+	b.mu.Lock()
+	c := b.verifyCancel[id]
+	delete(b.verifyCancel, id)
+	b.mu.Unlock()
+	if c != nil {
+		c()
+	}
 }
 
 // MarkFailed updates job+batch. Mutate under the lock, persist off it, SQL last.
@@ -1035,10 +1091,10 @@ func (b *BatchRunner) appendLog(j *Job, line, level, source string) {
 	b.persistLive(j.ID)
 }
 
-// HarvestOpts is the brief-2 seam. Verification is ignored in phase 1 —
-// harvest resolves on evidence alone, as TS did before commit 8938920.
+// HarvestOpts gates resolve on the post-fix verification run. Nil / ran==false
+// keeps evidence-only resolve (failed-agent harvest and jobs with no commands).
 type HarvestOpts struct {
-	Verification any
+	Verification *VerificationRun
 }
 
 var imageExts = map[string]bool{
@@ -1165,7 +1221,6 @@ func readFirstNote(root string, notBefore time.Time, cands ...string) (note stri
 }
 
 // harvestFixEvidence ports backend/src/jobs/batchJob.ts harvestFixEvidence.
-// verification is accepted so brief 2 can gate resolve without reshaping this.
 func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *HarvestOpts) {
 	if job == nil {
 		return
@@ -1173,7 +1228,10 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 	if harvestStartHook != nil {
 		harvestStartHook()
 	}
-	_ = opts // brief 2 inserts the verdict gate here, before resolve
+	var verification *VerificationRun
+	if opts != nil {
+		verification = opts.Verification
+	}
 	fixRoot := filepath.Join(handoff, "fix-evidence")
 	notesRoot := filepath.Join(handoff, "fix-notes")
 	imported := 0
@@ -1251,13 +1309,25 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 			b.appendLog(job, fmt.Sprintf("harvest %s: %d fix image(s) → evidence/", defectID, len(files)), "info", "DefectDrainer")
 		}
 
+		// Block on what THIS job broke or could not run — not on red that
+		// was already there before it started (see judgeVerification).
+		verdict := judgeVerification(verification, job.Baseline)
+		if verification != nil && verification.Ran && !verdict.Ok {
+			b.appendLog(job, "harvest "+defectID+": NOT resolved — "+summarizeVerdict(verdict), "warn", "DefectDrainer")
+			continue
+		}
+
 		if len(cur.FixEvidence) > 0 {
 			res := note
 			if res == "" {
 				res = cur.Resolution
 			}
 			if res == "" {
-				res = "fixed in batch " + job.BatchID + " (Grok + fix evidence)"
+				res = "fixed in batch " + job.BatchID + " (Grok + fix evidence"
+				if verification != nil && verification.Ran {
+					res += "; " + summarizeVerdict(judgeVerification(verification, job.Baseline))
+				}
+				res += ")"
 			}
 			if _, err := b.store.Resolve(defectID, res, cur.FixEvidence, false); err != nil {
 				b.appendLog(job, "harvest "+defectID+" failed: "+err.Error(), "error", "DefectDrainer")
@@ -1358,13 +1428,6 @@ func (b *BatchRunner) writeSpawnBrief(j *Job, defectsRoot, handoff string) error
 		GrokSandbox: sandbox,
 		Worktrees:   j.Worktrees,
 	})
-}
-
-func (b *BatchRunner) appSandbox(appID string) string {
-	if app, err := store.GetApp(b.store.DB, appID); err == nil && app != nil {
-		return store.ParseGrokSandbox(app.GrokSandbox)
-	}
-	return "strict"
 }
 
 // WriteFailClosedBrief writes BRIEF.md with an empty worktree list (the
@@ -1470,7 +1533,13 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 	}
 	b.starting[jobID] = done
 	b.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	b.setVerifyCancel(jobID, cancel)
+	launched := false
 	defer func() {
+		if !launched {
+			b.callVerifyCancel(jobID)
+		}
 		b.mu.Lock()
 		if b.starting[jobID] == done {
 			delete(b.starting, jobID)
@@ -1493,12 +1562,89 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 	}
 	b.mu.Unlock()
 
-	sandbox := b.appSandbox(appID)
+	app, _ := store.GetApp(b.store.DB, appID)
+	sandbox := "strict"
+	toolchainKind := "none"
+	simWrites := false
+	var verifyCommands []store.VerifyCommand
+	var repoEntries []store.AppRepoEntry
+	if app != nil {
+		sandbox = store.ParseGrokSandbox(app.GrokSandbox)
+		toolchainKind = store.ParseAgentToolchain(app.AgentToolchain)
+		simWrites = app.AllowSimulatorWrites
+		verifyCommands = store.NormalizeVerifyCommands(app.VerifyCommands)
+		repoEntries = app.RepoEntries
+	}
+	_ = os.MkdirAll(filepath.Join(handoff, "fix-evidence"), 0o755)
+	_ = os.MkdirAll(filepath.Join(handoff, "fix-notes"), 0o755)
+	b.appendLog(&jobCopy, fmt.Sprintf("app %s grok_sandbox=%s agent_toolchain=%s", appID, sandbox, toolchainKind), "info", "DefectDrainer")
+
+	spawnLog := func(line, level string) {
+		b.appendLog(&Job{ID: jobID}, line, level, "DefectDrainer")
+	}
+	provisioned := NO_TOOLCHAIN
+	if toolchainKind == "flutter" {
+		provisioned = provisionFlutterToolchain(handoff, wts, spawnLog)
+	}
+
+	var sandboxProfile string
+	var profileNotes []string
+	if simWrites {
+		profile, err := writeSimulatorSandboxProfile(handoff, sandbox, batchID)
+		if err != nil {
+			spawnLog("sandbox: job profile failed — skipped ("+err.Error()+")", "warn")
+		} else {
+			sandboxProfile = profile.Profile
+			profileNotes = profile.Notes
+			spawnLog("sandbox: job profile '"+profile.Profile+"' extends "+sandbox+" + Simulator device writes", "info")
+		}
+	}
+
+	diffBaseByRepo := map[string]string{}
+	for _, w := range wts {
+		diffBaseByRepo[w.Repo] = worktreeHead(w.WorktreeAbs)
+	}
+	realByRepo := snapshotWorktreeReals(wts)
+
+	var baseline *VerificationRun
+	if len(verifyCommands) > 0 {
+		run := runVerification(ctx, verifyCommands, wts, filepath.Join(handoff, "baseline"), repoEntries, provisioned.VerifyEnv, realByRepo, func(line, level string) {
+			spawnLog("baseline "+line, level)
+		})
+		baseline = &run
+		if run.Ran {
+			b.mu.Lock()
+			if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
+				live.Baseline = baseline
+				b.appendLogLocked(live, "baseline: "+summarizeVerification(run), "info", "DefectDrainer")
+			}
+			b.mu.Unlock()
+			b.persistLive(jobID)
+		}
+	}
+
+	b.mu.Lock()
+	if jobGoneOrCancelled(b.jobs[jobID]) {
+		b.mu.Unlock()
+		return nil
+	}
+	b.mu.Unlock()
+
 	bin := git.ResolveGrokBin()
-	b.appendLog(&jobCopy, fmt.Sprintf("app %s grok_sandbox=%s", appID, sandbox), "info", "DefectDrainer")
 	onStdout := func(line string) { b.appendLog(&Job{ID: jobID}, line, "info", "Grok") }
 	onStderr := func(line string) { b.appendLog(&Job{ID: jobID}, line, "warn", "Grok") }
-	cmd, flush, err := git.StartCodingAgent(handoff, batchID, defectsRoot, wts, sandbox, onStdout, onStderr)
+	var verifySpecs []git.VerifySpec
+	for _, v := range verifyCommands {
+		verifySpecs = append(verifySpecs, git.VerifySpec{Repo: v.Repo, Command: v.Command})
+	}
+	notes := append(append([]string{}, provisioned.Notes...), profileNotes...)
+	cmd, flush, err := git.StartCodingAgent(handoff, batchID, defectsRoot, wts, sandbox, onStdout, onStderr, &git.CodingAgentOpts{
+		ExtraEnv:       provisioned.Env,
+		SandboxProfile: sandboxProfile,
+		ToolchainNotes: notes,
+		VerifyCommands: verifySpecs,
+		AlreadyFailing: alreadyFailingLines(baseline),
+	})
 	if err != nil {
 		return err
 	}
@@ -1525,11 +1671,13 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 	}
 	b.mu.Unlock()
 	b.persistLive(jobID)
+	launched = true
 	go func() {
 		defer func() {
 			if spawnExitHook != nil {
 				spawnExitHook()
 			}
+			b.callVerifyCancel(jobID)
 		}()
 		err := proc.reap()
 		if flush != nil {
@@ -1542,32 +1690,68 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 			b.mu.Unlock()
 			return
 		}
-		if err != nil {
+		failed := err != nil
+		if failed {
 			live.Status = "failed"
 			live.Error = formatGrokExit(err)
 			b.appendLogLocked(live, live.Error, "error", "DefectDrainer")
 		} else {
-			live.Status = "completed"
 			live.Error = ""
-			b.appendLogLocked(live, "Grok process exited OK — harvesting fix-evidence…", "info", "DefectDrainer")
 		}
-		outcome := live.Status
 		b.mu.Unlock()
 		b.persistLive(jobID)
 		if b.GetJob(jobID) == nil {
 			return
 		}
-		// verification is nil: brief 2 inserts the verdict gate at this call site.
-		b.harvestFixEvidence(live, handoff, nil)
-		if b.GetJob(jobID) == nil {
+		var harvestOpts *HarvestOpts
+		if !failed {
+			run := runVerification(ctx, verifyCommands, wts, handoff, repoEntries, provisioned.VerifyEnv, realByRepo, spawnLog)
+			hygiene := measureDiffHygiene(wts, diffBaseByRepo, spawnLog)
+			verdict := judgeVerification(&run, baseline)
+			level := "info"
+			if !verdict.Ok {
+				level = "warn"
+			}
+			b.mu.Lock()
+			if live = b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
+				cp := run
+				live.Verification = &cp
+				h := hygiene
+				live.DiffHygiene = &h
+				if baseline != nil {
+					live.Baseline = baseline
+				}
+				b.appendLogLocked(live, "verify: "+summarizeVerdict(verdict), level, "DefectDrainer")
+				b.appendLogLocked(live, "Grok process exited OK — harvesting fix-evidence…", "info", "DefectDrainer")
+			}
+			b.mu.Unlock()
+			b.persistLive(jobID)
+			harvestOpts = &HarvestOpts{Verification: &run}
+		}
+		if j := b.GetJob(jobID); j == nil || jobGoneOrCancelled(j) {
 			return
 		}
-		if outcome == "failed" {
-			b.SyncBatchAndDefects(live, "failed")
-		} else {
-			b.SyncBatchAndDefects(live, "complete")
-			b.appendLog(live, "batch complete — review worktrees; merge when satisfied", "info", "DefectDrainer")
+		b.harvestFixEvidence(b.GetJob(jobID), handoff, harvestOpts)
+		live = b.GetJob(jobID)
+		if live == nil || jobGoneOrCancelled(live) {
+			return
 		}
+		if failed {
+			b.SyncBatchAndDefects(live, "failed")
+			return
+		}
+		b.mu.Lock()
+		if cur := b.jobs[jobID]; cur != nil && !jobGoneOrCancelled(cur) {
+			cur.Status = "completed"
+		}
+		b.mu.Unlock()
+		b.persistLive(jobID)
+		live = b.GetJob(jobID)
+		if live == nil || jobGoneOrCancelled(live) {
+			return
+		}
+		b.SyncBatchAndDefects(live, "complete")
+		b.appendLog(live, "batch complete — review worktrees; merge when satisfied", "info", "DefectDrainer")
 	}()
 	return nil
 }
@@ -1591,7 +1775,12 @@ func (b *BatchRunner) Stop(jobID string) (*Job, error) {
 	if slot == nil {
 		b.appendLogLocked(j, "no live process handle (may still be starting)", "warn", "DefectDrainer")
 	}
+	c := b.verifyCancel[jobID]
+	delete(b.verifyCancel, jobID)
 	b.mu.Unlock()
+	if c != nil {
+		c()
+	}
 	b.persistLive(jobID)
 	if slot != nil && slot.cmd != nil && slot.cmd.Process != nil {
 		_ = slot.cmd.Process.Signal(os.Interrupt)

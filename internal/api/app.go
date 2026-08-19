@@ -128,6 +128,7 @@ func (a *App) mux() http.Handler {
 	m.HandleFunc("POST /api/batches", a.postBatch)
 	m.HandleFunc("GET /api/batches/{id}", a.getBatch)
 	m.HandleFunc("GET /api/batch-jobs/{id}", a.getBatchJob)
+	m.HandleFunc("GET /api/batch-jobs/{id}/diff/{repo}", a.getBatchJobDiff)
 	m.HandleFunc("DELETE /api/batch-jobs/{id}", a.deleteBatchJob)
 	m.HandleFunc("POST /api/batch-jobs/{id}/stop", a.stopBatchJob)
 	m.HandleFunc("POST /api/batch-jobs/{id}/rerun", a.rerunBatchJob)

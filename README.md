@@ -60,11 +60,16 @@ export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend/.data
 2. Create `git worktree`s (`defect-drainer/<BATCH-id>`). No local/repo URLs → **400** and `SyncBatchAndDefects(..., failed)` (defects reopen).
 3. Persist bindings on `job.worktrees`. Empty worktrees refuse spawn.
 4. Write `BRIEF.md` (acceptance criteria + per-worktree contract files) and the batch manifest. Fail-closed 400s still write the brief so the handoff explains why spawn did not start.
-5. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`) with `--sandbox` from the app `grok_sandbox` (`workspace` or `strict`).
-6. After the agent exits, harvest `fix-evidence/` + `fix-notes/` (regular files under the handoff only) and resolve defects that have `fix_evidence`. Then `SyncBatchAndDefects`: `complete` leaves harvested defects; `failed`/`cancelled` reopens `in_progress` rows with no `fix_evidence`. Verification commands are not run yet.
-7. `POST /api/batch-jobs/{id}/create-prs` and `refresh-prs` run host `gh` (`GH_BIN` overrides) and write `job.prs[]` (`status`, `url`, `ghNumber`, `ghState`, `mergedAt`, `checkedAt`, `branch`, `error`). Skip when there are no commits vs the resolved base (never `origin/origin/main`).
+5. If `agent_toolchain=flutter`, clone the pinned SDK into `<handoff>/.tooling` (`cp -Rc`; skip + warn on missing/conflicting pins). If `allow_simulator_writes`, write a job-scoped `<handoff>/.grok/sandbox.toml` (`dd-simulator`) — never `~/.grok`. Record each worktree `HEAD`. If `verify_commands` is set, run them as **baseline** into `<handoff>/baseline` and persist `job.baseline`.
+6. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`) with `--sandbox` from the app `grok_sandbox` (`workspace` or `strict`), or `dd-simulator` when a job profile was written. Prompt includes toolchain notes, VERIFICATION commands, and already-failing baseline rows.
+7. On agent **success**: re-run `verify_commands` into the handoff (`job.verification`, `verify.json`), measure diff hygiene vs the recorded heads (`job.diffHygiene`; advisory only), `judgeVerification` (only `regression` and `blocked` stop a resolve), then harvest. On **failure**: harvest with no verification (partial evidence, no resolve-gate). On **cancel**: existing stop path.
+8. Harvest `fix-evidence/` + `fix-notes/` (regular files under the handoff only). Evidence may import even when the verdict is not ok; resolve and notes-only are skipped unless the verdict is ok or verification did not run. Then `SyncBatchAndDefects`: `complete` leaves harvested defects; `failed`/`cancelled` reopens `in_progress` rows with no `fix_evidence`.
+9. `POST /api/batch-jobs/{id}/create-prs` and `refresh-prs` run host `gh` (`GH_BIN` overrides) and write `job.prs[]` (`status`, `url`, `ghNumber`, `ghState`, `mergedAt`, `checkedAt`, `branch`, `error`). Skip when there are no commits vs the resolved base (never `origin/origin/main`).
+10. `GET /api/batch-jobs/{id}/diff/{repo}` returns hunks for the console drill-down (`kind=reflow|all`). 404 unknown job / no worktree; 409 no recorded `baseSha`; 410 worktree gone.
 
-`GET /api/batches` returns `{ batches, jobs }`. Job JSON writes `jobId` (still reads legacy `id`) and keeps unknown keys so a shared DATA dir does not strip TS-written fields (`verification`, `baseline`, `diffHygiene`).
+`GET /api/batches` returns `{ batches, jobs }`. Job JSON writes `jobId` (still reads legacy `id`) and first-class `verification` / `baseline` / `diffHygiene` (unknown keys still round-trip via Extra).
+
+The verification runner is **not sandboxed**. Commands come only from App Settings (`verify_commands`), never from the agent. Their PATH is the host pin (`$FVM_HOME/versions/<pin>/bin`), not the agent-writable handoff clone.
 
 `start_fix: true` + `manual` stays planned / job `manual` and does **not** flip defects.
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -615,6 +616,75 @@ func (a *App) getBatchJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j})
+}
+
+func (a *App) getBatchJobDiff(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	repo := r.PathValue("repo")
+	j := a.Batches.GetJob(id)
+	if j == nil {
+		httpx.WriteError(w, http.StatusNotFound, "not found")
+		return
+	}
+	var wt *gitpkg.WorktreeBinding
+	for i := range j.Worktrees {
+		if j.Worktrees[i].Repo == repo {
+			wt = &j.Worktrees[i]
+			break
+		}
+	}
+	if wt == nil {
+		httpx.WriteError(w, http.StatusNotFound, `no worktree "`+repo+`" on this job`)
+		return
+	}
+	var baseSha string
+	if j.DiffHygiene != nil {
+		for _, row := range j.DiffHygiene.Repos {
+			if row.Repo == repo {
+				baseSha = row.BaseSha
+				break
+			}
+		}
+	}
+	if baseSha == "" {
+		httpx.WriteError(w, http.StatusConflict, "no diff baseline recorded for this job")
+		return
+	}
+	if _, err := os.Stat(wt.WorktreeAbs); err != nil {
+		httpx.WriteError(w, http.StatusGone, "worktree is gone: "+wt.WorktreeAbs)
+		return
+	}
+	kind := "reflow"
+	if r.URL.Query().Get("kind") == "all" {
+		kind = "all"
+	}
+	limit := 50
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n != 0 {
+			limit = n
+		}
+	}
+	if limit < 1 {
+		limit = 1
+	} else if limit > 200 {
+		limit = 200
+	}
+	hunks, total, truncated, err := jobs.CollectHunks(wt.WorktreeAbs, baseSha, kind, limit)
+	if err != nil {
+		if err.Error() == "invalid diff baseline" {
+			httpx.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"repo":      repo,
+		"kind":      kind,
+		"hunks":     hunks,
+		"total":     total,
+		"truncated": truncated,
+	})
 }
 
 func (a *App) deleteBatchJob(w http.ResponseWriter, r *http.Request) {
