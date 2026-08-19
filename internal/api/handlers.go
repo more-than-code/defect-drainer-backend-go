@@ -521,7 +521,7 @@ func (a *App) getBatches(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list, "jobs": a.Batches.List()})
 }
 
 func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
@@ -559,6 +559,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(primaries) == 0 {
 			msg := "no product repos resolved for worktrees — set defect.repos and/or app.repos + workspace_root"
+			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
 			a.Batches.MarkFailed(job.ID, rec.ID, msg)
 			a.Batches.SyncBatchAndDefects(a.Batches.GetJob(job.ID), "failed")
 			httpx.WriteError(w, http.StatusBadRequest, msg)
@@ -567,6 +568,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 		root := filepath.Join(a.Roots.DataRoot, "batch-jobs", job.ID, "worktrees")
 		wts, err := gitpkg.CreateBatchWorktrees(rec.ID, root, primaries)
 		if err != nil {
+			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
 			a.Batches.MarkFailed(job.ID, rec.ID, err.Error())
 			a.Batches.SyncBatchAndDefects(a.Batches.GetJob(job.ID), "failed")
 			httpx.WriteError(w, http.StatusBadRequest, err.Error())
@@ -574,6 +576,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(wts) == 0 {
 			msg := "no worktrees — refusing Grok spawn"
+			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
 			a.Batches.MarkFailed(job.ID, rec.ID, msg)
 			a.Batches.SyncBatchAndDefects(a.Batches.GetJob(job.ID), "failed")
 			httpx.WriteError(w, http.StatusBadRequest, msg)

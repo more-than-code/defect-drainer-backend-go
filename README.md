@@ -57,10 +57,14 @@ export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend/.data
 `POST /api/batches` with `start_fix: true` and `mode: grok` follows the TS path:
 
 1. Flip selected `open` / `triaged` defects to `in_progress`.
-2. Create `git worktree`s (`defect-drainer/<BATCH-id>`). No local/repo URLs → **400** and `syncBatchAndDefects(..., failed)` (defects reopen).
+2. Create `git worktree`s (`defect-drainer/<BATCH-id>`). No local/repo URLs → **400** and `SyncBatchAndDefects(..., failed)` (defects reopen).
 3. Persist bindings on `job.worktrees`. Empty worktrees refuse spawn.
-4. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`).
-5. `POST /api/batch-jobs/{id}/create-prs` and `refresh-prs` run host `gh` (`GH_BIN` overrides) and write `job.prs[]` (`status`, `url`, `ghState`, `mergedAt`, `checkedAt`). Skip when there are no commits vs the resolved base (never `origin/origin/main`).
+4. Write `BRIEF.md` (acceptance criteria + per-worktree contract files) and the batch manifest. Fail-closed 400s still write the brief so the handoff explains why spawn did not start.
+5. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`) with `--sandbox` from the app `grok_sandbox` (`workspace` or `strict`).
+6. After the agent exits, harvest `fix-evidence/` + `fix-notes/` (regular files under the handoff only) and resolve defects that have `fix_evidence`. Then `SyncBatchAndDefects`: `complete` leaves harvested defects; `failed`/`cancelled` reopens `in_progress` rows with no `fix_evidence`. Verification commands are not run yet.
+7. `POST /api/batch-jobs/{id}/create-prs` and `refresh-prs` run host `gh` (`GH_BIN` overrides) and write `job.prs[]` (`status`, `url`, `ghNumber`, `ghState`, `mergedAt`, `checkedAt`, `branch`, `error`). Skip when there are no commits vs the resolved base (never `origin/origin/main`).
+
+`GET /api/batches` returns `{ batches, jobs }`. Job JSON writes `jobId` (still reads legacy `id`) and keeps unknown keys so a shared DATA dir does not strip TS-written fields (`verification`, `baseline`, `diffHygiene`).
 
 `start_fix: true` + `manual` stays planned / job `manual` and does **not** flip defects.
 

@@ -7,7 +7,7 @@ Go control-plane binary (`defect-drainer`) that will replace Node as the harness
 
 - Inventory SSOT is **shared**: `backend/.data/defect-drainer.db` + umbrella `../evidence/` — do not invent a second store
 - One writer per data dir (`{DATA}/defect-drainer.lock`). TS (`koffi`/`libc.flock`) and Go (`syscall.Flock`) both take `LOCK_EX|LOCK_NB` before listen
-- `start_fix`+`grok` is the TS worker path (flip `in_progress` → worktrees → spawn). `create-prs`/`refresh-prs` exec `GH_BIN`/`gh` and persist `job.prs[]`
+- `start_fix`+`grok` is the TS worker path (flip `in_progress` → worktrees → BRIEF.md → spawn → harvest/resolve). `create-prs`/`refresh-prs` exec `GH_BIN`/`gh` and persist `job.prs[]` (`ghNumber`). Job JSON key is `jobId`.
 - Env: `DEFECT_DRAINER_*` (legacy `DEFECT_CHANNEL_*` still read). `DEFECTS_ROOT` has no prefix pair
 - Product language: agent harness / coding agent / workflow / inventory
 - Cross-repo plans: `/Users/joe/workspace/defect-drainer/tasks/todo.md`
