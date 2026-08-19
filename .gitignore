@@ -9,3 +9,8 @@ coverage.out
 .env
 .DS_Store
 SESSION.md
+
+# Live task ledger: never travels with a branch checkout (keeps it out of worker
+# worktrees and merges).
+tasks/
+
