@@ -1,5 +1,8 @@
 BIN := bin/defect-drainer
-.PHONY: build test vet cross-linux
+.PHONY: build test vet cross-linux serve
+
+serve:
+	go run ./cmd/defect-drainer serve
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$$(git describe --always --dirty)" -o $(BIN) ./cmd/defect-drainer

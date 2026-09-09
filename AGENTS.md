@@ -1,9 +1,9 @@
 # defect-drainer-go
 
-**Folder:** `backend-go/` · **Git name:** `defect-drainer-go`  
+**Folder:** `backend-go/` · **Git name:** `defect-drainer-backend-go`  
 **Module:** `github.com/joe/defect-drainer-go`
 
-Go control-plane binary (`defect-drainer`) that will replace Node as the harness API runtime. Design: `../docs/go-backend.md`. Framing: `../backend/docs/workflow.md`.
+Go control-plane binary (`defect-drainer`) — **live** harness API runtime. Design: `../docs/go-backend.md`. Framing: `../backend/docs/workflow.md`. TS `../backend/` is rollback only.
 
 - Inventory SSOT is **shared**: `backend/.data/defect-drainer.db` + umbrella `../evidence/` — do not invent a second store
 - One writer per data dir (`{DATA}/defect-drainer.lock`). TS (`koffi`/`libc.flock`) and Go (`syscall.Flock`) both take `LOCK_EX|LOCK_NB` before listen
@@ -12,7 +12,7 @@ Go control-plane binary (`defect-drainer`) that will replace Node as the harness
 - Product language: agent harness / coding agent / workflow / inventory
 - Cross-repo plans: `/Users/joe/workspace/defect-drainer/tasks/todo.md`
 - Local tasks: `tasks/todo.md` (this package only)
-- Run: `go test ./...`; `go run ./cmd/defect-drainer serve` → `127.0.0.1:8788` after lock + DB open
+- Run: `go test ./...`; `go run ./cmd/defect-drainer serve` (or `make serve`) → `127.0.0.1:8788` after lock + DB open. DATA defaults to `../backend/.data` when that DB exists.
 - Only extra module: pinned `modernc.org/sqlite`. `CGO_ENABLED=0`. Flock is `syscall.Flock`.
 
 ## Session ownership (worktree)

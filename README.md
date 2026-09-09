@@ -1,11 +1,11 @@
 # defect-drainer-go
 
 **In-workspace path:** `backend-go/`  
-**Git repo name:** `defect-drainer-go`  
+**Git repo name:** `defect-drainer-backend-go`  
 **Module:** `github.com/joe/defect-drainer-go`  
 **Binary:** `defect-drainer`
 
-Go control-plane rewrite of the Defect Drainer harness API. Goal: a static binary so operator and EC2 hosts do not need **Node as a runtime**. Compose `api.build` is `../backend-go`; rollback is revert that line to `../backend`. Local TS `pnpm dev` still works when this binary is not running.
+Go control-plane of the Defect Drainer harness API. Goal: a static binary so operator and EC2 hosts do not need **Node as a runtime**. This tree is the **live** API (`serve` :8788). Compose `api.build` is `../backend-go`. Rollback: stop this process and `cd ../backend && pnpm dev` (same `{DATA}`), and/or revert compose `api.build` to `../backend`.
 
 Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`../backend/docs/workflow.md`](../backend/docs/workflow.md).
 
@@ -14,15 +14,14 @@ Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`../
 ## Run
 
 ```bash
-cd /Users/joe/workspace/defect-drainer-go-rewrite/backend-go
+cd /Users/joe/workspace/defect-drainer/backend-go
 go test ./...
-go run ./cmd/defect-drainer version
-export DEFECTS_ROOT=/Users/joe/workspace/defect-drainer
-export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer-go-rewrite/runtime
 go run ./cmd/defect-drainer serve
+# → http://127.0.0.1:8788
+# DEFECTS_ROOT = umbrella; DEFECT_DRAINER_DATA = ../backend/.data when that DB exists.
 ```
 
-Or `make test` / `make build` (`CGO_ENABLED=0`). Cross-compile: `make cross-linux`.
+Or `make serve` / `make test` / `make build` (`CGO_ENABLED=0`). Cross-compile: `make cross-linux`.
 
 ## One-writer rule
 
@@ -43,7 +42,7 @@ Legacy `DEFECT_CHANNEL_*` is still read. `.env` is only `backend-go/.env`, loade
 
 If those roots cannot be resolved (PATH-installed binary, no `go.mod` in cwd, no existing sibling `backend/.data/defect-drainer.db`), the process **exits 1**. It will not mkdir a second inventory.
 
-During coexistence, point at the live SSOT:
+From `backend-go/` in this umbrella, `serve` already picks that SSOT. Override only when the binary cannot see the tree:
 
 ```bash
 export DEFECTS_ROOT=/Users/joe/workspace/defect-drainer
@@ -79,7 +78,7 @@ The verification runner is **not sandboxed**. Commands come only from App Settin
 
 ## Related
 
-- Live API: `../backend/` (`defect-drainer-backend`)
+- Rollback API: `../backend/` (`defect-drainer-backend`) — stop Go first
 - Operator UI: `../console/` (React/Vite; Node is build-time only)
 - Umbrella status: `../tasks/todo.md`
 
