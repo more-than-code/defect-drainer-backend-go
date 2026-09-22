@@ -135,6 +135,51 @@ func BuildBatchFixBrief(input BatchFixBriefInput) string {
 	lines = append(lines,
 		"# Batch agent fix — "+input.Batch.ID,
 		"",
+		"## Role",
+		"You are the **worker** for this job. This brief and `PROCESS.md` (same",
+		"directory) outrank any per-turn instruction that contradicts them.",
+		"- Read `PROCESS.md` before your first product edit. It is the worker contract.",
+		"- Read `SKILLS.md` for the skills and contract files of each worktree.",
+		"- Do not delegate onward. Do not spawn another coding-agent CLI.",
+		"",
+		"## Facts",
+		"- Defect Drainer is the harness; this brief is the ask.",
+		"- Inventory SSOT is SQLite + evidence files under `"+input.DefectsRoot+"/evidence`; you cannot write it.",
+		"- The worktrees listed below are the only product paths you may write.",
+		"- cwd is this handoff directory, not a product repo — skill discovery by directory will not fire.",
+		"",
+		"## Decisions already made (do not relitigate)",
+		"",
+		"| Decision | Value |",
+		"|---|---|",
+		"| Spec approval | the operator started this batch — do not wait to be approved |",
+		"| Defects in scope | exactly the ids listed below |",
+		"| Sandbox profile | **"+sandbox+"** (App Settings) |",
+		"| Branch | the worktree branch already checked out — do not create another |",
+		"| Verification | operator-authored commands, re-run by DD after you exit; you may not add or edit them |",
+		"| Worker ledger | `NOTES.md` + `fix-notes/`, never `tasks/todo.md` |",
+		"",
+		"## Environment",
+		"- Any toolchain this job needs is already provisioned; the spawn prompt carries the specifics.",
+		"- Do not re-scaffold Flutter and do not clone a second SDK.",
+		"- Package installs: if the sandbox blocks a cache write, stop and record it in `NOTES.md`.",
+		"  Do not overlay-symlink `~/fvm` or any other toolchain root to work around it.",
+		"",
+		"## Deliverables",
+		"- `NOTES.md` — plan, decisions, departures, anything you could not verify.",
+		"- `fix-notes/<DEF-id>.md` for each defect you claim fixed, answering every acceptance line.",
+		"- `fix-evidence/<DEF-id>/fix-01.png` for each defect you claim fixed.",
+		"",
+		"## Honesty constraints",
+		"- Never report a test result you did not observe. DD re-runs verification itself;",
+		"  a claimed pass that fails on re-run is worse than an admitted failure.",
+		"- Never reply DONE without the files. Prose is ignored when the files are missing.",
+		"- Do not invent acceptance criteria, and do not quietly drop one you could not meet — say so.",
+		"",
+		"## NOTES.md (required)",
+		"Record the per-defect plan and its blast-radius tier, decisions and any departure from",
+		"this brief, what you could not verify, and what the operator must do next.",
+		"",
 		"## Goal",
 		input.Batch.Goal,
 		"",
@@ -256,18 +301,39 @@ func BuildBatchFixBrief(input BatchFixBriefInput) string {
 	}
 	lines = append(lines,
 		"## Done",
-		"When code fixes are in worktrees and **this job's** fix-evidence/notes exist for each fixed defect: reply `DONE "+input.Batch.ID+"`.",
+		"Completion is measured in **files**, not prose.",
+		"",
+		"1. Write `NOTES.md`.",
+		"2. For each defect you claim fixed:",
+		"   - `fix-notes/<DEF-id>.md` answering every acceptance criterion, and",
+		"   - `fix-evidence/<DEF-id>/fix-01.png`.",
+		"   - If the sandbox is **strict** and you cannot screenshot, put a line reading exactly",
+		"     `NO-SCREENSHOT: <DEF-id>` in `NOTES.md`. That releases the run only — the defect",
+		"     still will not resolve without a new image.",
+		"3. To decline a defect, put a line reading exactly `UNFIXED: <DEF-id>` in `NOTES.md`.",
+		"   The job may complete; that defect will not resolve.",
+		"4. Only once those files exist, reply `DONE "+input.Batch.ID+"`.",
+		"",
+		"Defect Drainer ignores the prose when the files are missing.",
 		"",
 	)
 	return strings.Join(lines, "\n")
 }
 
-// WriteHandoffBrief writes BRIEF.md plus the sandbox-writable harvest dirs.
+// WriteHandoffBrief writes BRIEF.md, the DD-owned PROCESS.md worker contract,
+// the generated SKILLS.md path listing, and the sandbox-writable harvest dirs.
 func WriteHandoffBrief(handoff string, input BatchFixBriefInput) error {
 	if err := os.MkdirAll(filepath.Join(handoff, "fix-evidence"), 0o755); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(handoff, "fix-notes"), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(handoff, "PROCESS.md"), []byte(processMarkdown), 0o644); err != nil {
+		return err
+	}
+	skills := buildSkillsMarkdown(input.Worktrees)
+	if err := os.WriteFile(filepath.Join(handoff, "SKILLS.md"), []byte(skills), 0o644); err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(handoff, "BRIEF.md"), []byte(BuildBatchFixBrief(input)), 0o644)

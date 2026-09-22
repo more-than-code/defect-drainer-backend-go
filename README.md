@@ -58,7 +58,7 @@ export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend/.data
 1. Flip selected `open` / `triaged` defects to `in_progress`.
 2. Create `git worktree`s (`defect-drainer/<BATCH-id>`). No local/repo URLs → **400** and `SyncBatchAndDefects(..., failed)` (defects reopen).
 3. Persist bindings on `job.worktrees`. Empty worktrees refuse spawn.
-4. Write `BRIEF.md` (acceptance criteria + per-worktree contract files) and the batch manifest. Fail-closed 400s still write the brief so the handoff explains why spawn did not start.
+4. Write `BRIEF.md` (worker role, decisions, acceptance criteria, defects), the DD-owned `PROCESS.md` worker contract, the generated `SKILLS.md` (per-worktree contract files and `SKILL.md` entries from `.agents/skills` / `.claude/skills` / `.grok/skills` — name, one-line summary and path, never bodies), and the batch manifest. Fail-closed 400s still write all three so the handoff explains why spawn did not start.
 5. If `agent_toolchain=flutter`, clone the pinned SDK into `<handoff>/.tooling` (`cp -Rc`; skip + warn on missing/conflicting pins). If `allow_simulator_writes`, write a job-scoped `<handoff>/.grok/sandbox.toml` (`dd-simulator`) — never `~/.grok`. Record each worktree `HEAD`. If `verify_commands` is set, run them as **baseline** into `<handoff>/baseline` and persist `job.baseline`.
 6. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`) with `--sandbox` from the app `grok_sandbox` (`workspace` or `strict`), or `dd-simulator` when a job profile was written. Prompt includes toolchain notes, VERIFICATION commands, and already-failing baseline rows.
 7. On agent **success**: re-run `verify_commands` into the handoff (`job.verification`, `verify.json`), measure diff hygiene vs the recorded heads (`job.diffHygiene`; advisory only), `judgeVerification` (only `regression` and `blocked` stop a resolve), then harvest. On **failure**: harvest with no verification (partial evidence, no resolve-gate). On **cancel**: existing stop path.
@@ -67,6 +67,8 @@ export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend/.data
 10. `GET /api/batch-jobs/{id}/diff/{repo}` returns hunks for the console drill-down (`kind=reflow|all`). 404 unknown job / no worktree; 409 no recorded `baseSha`; 410 worktree gone.
 
 `GET /api/batches` returns `{ batches, jobs }`. Job JSON writes `jobId` (still reads legacy `id`) and first-class `verification` / `baseline` / `diffHygiene` (unknown keys still round-trip via Extra).
+
+The spawned child carries `SKILL_FORGE_AGENT_ROLE=worker`; `serve` itself never sets it, so a human session started from the same shell is not marked as a worker.
 
 The verification runner is **not sandboxed**. Commands come only from App Settings (`verify_commands`), never from the agent. Their PATH is the host pin (`$FVM_HOME/versions/<pin>/bin`), not the agent-writable handoff clone.
 

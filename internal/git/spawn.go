@@ -262,6 +262,20 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 		"  skills and conventions; where stricter than this brief, they win. Follow its",
 		"  house style — do not reformat code the fix does not need to touch.",
 		"",
+		"ROLE (SKILL_FORGE_AGENT_ROLE=worker is set on this process):",
+		"- You are the worker for this job, not an orchestrator. Do not delegate onward.",
+		"- Read, in this order, BEFORE the first product edit: BRIEF.md, PROCESS.md,",
+		"  SKILLS.md, then each contract file SKILLS.md lists for the worktree you touch.",
+		"- SKILLS.md carries absolute paths because cwd is the handoff, not a product repo;",
+		"  directory-based skill discovery will not find them. If SKILLS.md lists none for a",
+		"  worktree, use security-baseline, coding-discipline, code-quality and testing-strategy.",
+		"- Classify each defect's blast radius (Tier 1/2/3) in NOTES.md, then proceed:",
+		"  the operator starting this batch IS the approval. Do not wait to be approved.",
+		"- Run the verification commands yourself inside the worktree. DD re-runs them after",
+		"  you exit; a result you claim but did not observe is a defect in your notes, not a pass.",
+		"- Commit on the worktree branch already checked out. Do not push. Do not commit on",
+		"  main/master. Do not commit BRIEF.md / PROCESS.md / SKILLS.md / NOTES.md.",
+		"",
 		"Read BRIEF.md first. For each defect it lists:",
 		"- report evidence (bug as reported)",
 		"- historical fix evidence (prior proof on the defect SSOT — use as context / regression baseline)",
@@ -273,6 +287,7 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 		"3. REQUIRED **new** deliverables under this cwd (backend harvests onto the defect):",
 		"   - fix-evidence/<DEF-id>/fix-01.png (and more images as needed)",
 		"   - fix-notes/<DEF-id>.md  (what changed + how verified; note relation to prior fix if any)",
+		"   - NOTES.md (plan + tier per defect, decisions, departures, what you could not verify)",
 		"   - fix-notes must answer EACH acceptance criterion listed for that defect in BRIEF.md.",
 		"     Those criteria are the definition of fixed — not your own reading of the title.",
 		"     If one cannot be met, say so explicitly instead of omitting it.",
@@ -333,9 +348,13 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	for _, w := range worktrees {
 		wtPaths = append(wtPaths, w.WorktreeAbs)
 	}
+	// SKILL_FORGE_AGENT_ROLE marks the child as the worker end of the
+	// delegation. Never set it on the serve process: a leaked value would tell
+	// a human session started from the same shell that it is a worker.
 	cmd.Env = append(os.Environ(),
 		"CI=1",
 		"GROK_SANDBOX="+sandboxArg,
+		"SKILL_FORGE_AGENT_ROLE=worker",
 	)
 	if opts != nil {
 		for k, v := range opts.ExtraEnv {

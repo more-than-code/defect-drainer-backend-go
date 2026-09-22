@@ -7,7 +7,7 @@ Go control-plane binary (`defect-drainer`) — **live** harness API runtime. Des
 
 - Inventory SSOT is **shared**: `backend/.data/defect-drainer.db` + umbrella `../evidence/` — do not invent a second store
 - One writer per data dir (`{DATA}/defect-drainer.lock`). TS (`koffi`/`libc.flock`) and Go (`syscall.Flock`) both take `LOCK_EX|LOCK_NB` before listen
-- `start_fix`+`grok` is the TS worker path (flip `in_progress` → worktrees → BRIEF.md → toolchain/sandbox provision → baseline → spawn → verify → verdict-gated harvest/resolve). Diff hygiene is advisory (`GET /api/batch-jobs/{id}/diff/{repo}`). Job-scoped `<handoff>/.grok/sandbox.toml` (`dd-simulator`) never edits `~/.grok`. `create-prs`/`refresh-prs` exec `GH_BIN`/`gh` and persist `job.prs[]` (`ghNumber`). Job JSON key is `jobId`.
+- `start_fix`+`grok` is the worker path (flip `in_progress` → worktrees → BRIEF.md + PROCESS.md + SKILLS.md → toolchain/sandbox provision → baseline → spawn (child env `SKILL_FORGE_AGENT_ROLE=worker`) → verify → verdict-gated harvest/resolve). Diff hygiene is advisory (`GET /api/batch-jobs/{id}/diff/{repo}`). Job-scoped `<handoff>/.grok/sandbox.toml` (`dd-simulator`) never edits `~/.grok`. `create-prs`/`refresh-prs` exec `GH_BIN`/`gh` and persist `job.prs[]` (`ghNumber`). Job JSON key is `jobId`.
 - Env: `DEFECT_DRAINER_*` (legacy `DEFECT_CHANNEL_*` still read). `DEFECTS_ROOT` has no prefix pair
 - Product language: agent harness / coding agent / workflow / inventory
 - Cross-repo plans: `/Users/joe/workspace/defect-drainer/tasks/todo.md`

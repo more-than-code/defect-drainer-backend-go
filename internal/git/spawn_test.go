@@ -239,3 +239,67 @@ func TestStartCodingAgentExtraEnvAndSandboxProfile(t *testing.T) {
 		t.Fatalf("prompt should describe the base profile:\n%s", s)
 	}
 }
+
+func TestStartCodingAgentMarksWorkerRole(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "args.txt")
+	bin := filepath.Join(t.TempDir(), "fake-grok")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + out + "\"\nprintf 'ROLE=%s\\n' \"$SKILL_FORGE_AGENT_ROLE\" >> \"" + out + "\"\nexit 0\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_BUILD_BIN", bin)
+	handoff := t.TempDir()
+	wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
+	// Whatever the operator's shell carries — the orchestrator is legitimately
+	// marked SKILL_FORGE_AGENT_ROLE=orchestrator — must survive the spawn
+	// untouched. Assert the delta, not an absolute: reading the ambient value
+	// and demanding it be empty makes the test pass or fail on the developer's
+	// environment rather than on this function.
+	parentRoleBefore, parentRoleSet := os.LookupEnv("SKILL_FORGE_AGENT_ROLE")
+	cmd, flush, err := StartCodingAgent(handoff, "BATCH-role", t.TempDir(), wts, "strict", nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if flush != nil {
+		flush()
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(got)
+	if !strings.Contains(s, "ROLE=worker") {
+		t.Fatalf("child env missing SKILL_FORGE_AGENT_ROLE=worker:\n%s", s)
+	}
+	// The parent must not be mutated, and must never come out marked worker.
+	parentRoleAfter, parentRoleSetAfter := os.LookupEnv("SKILL_FORGE_AGENT_ROLE")
+	if parentRoleSetAfter != parentRoleSet || parentRoleAfter != parentRoleBefore {
+		t.Fatalf("StartCodingAgent mutated the parent role: before=%q(set=%v) after=%q(set=%v)",
+			parentRoleBefore, parentRoleSet, parentRoleAfter, parentRoleSetAfter)
+	}
+	if parentRoleAfter == "worker" {
+		t.Fatalf("the serve process is marked as a worker")
+	}
+	for _, want := range []string{
+		"ROLE (SKILL_FORGE_AGENT_ROLE=worker is set on this process)",
+		"BRIEF.md, PROCESS.md,",
+		"SKILLS.md",
+		"security-baseline, coding-discipline, code-quality and testing-strategy",
+		"Do not push",
+		"the operator starting this batch IS the approval",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("spawn prompt missing %q:\n%s", want, s)
+		}
+	}
+	// Load-bearing pre-H1 content must survive the additions.
+	if argvFlagValue(s, "--sandbox") != "strict" {
+		t.Fatalf("sandbox argv want strict, got %q", argvFlagValue(s, "--sandbox"))
+	}
+	if !strings.Contains(s, "WORKTREE ENFORCEMENT (mandatory)") {
+		t.Fatalf("worktree enforcement block dropped:\n%s", s)
+	}
+}
