@@ -5,11 +5,11 @@
 **Module:** `github.com/joe/defect-drainer-go`  
 **Binary:** `defect-drainer`
 
-Go control-plane of the Defect Drainer harness API. Goal: a static binary so operator and EC2 hosts do not need **Node as a runtime**. This tree is the **live** API (`serve` :8788). Compose `api.build` is `../backend-go`. Rollback: stop this process and `cd ../backend && pnpm dev` (same `{DATA}`), and/or revert compose `api.build` to `../backend`.
+Go control-plane of the Defect Drainer harness API. Goal: a static binary so operator and EC2 hosts do not need **Node as a runtime**. This tree is **the** API (`serve` :8788) and owns the inventory data dir. Compose `api.build` is `../backend-go`. The TS `backend/` tree it replaced was retired and deleted on 2026-09-22 — there is no `pnpm dev` rollback; its history is in the `defect-drainer-backend` remote.
 
-Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`../backend/docs/workflow.md`](../backend/docs/workflow.md).
+Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`docs/workflow.md`](docs/workflow.md). Why the verification gates exist: [`docs/verification-hardening.md`](docs/verification-hardening.md).
 
-`serve` listens after POSIX `flock` + SQLite open and serves the console HTTP contract (inventory, intake, batches, search). `healthcheck` GETs `HOST:PORT/health` and exits 0 only when HTTP 200 **and** `ok: true`. The `worker` **subcommand** is still reserved (exit 1); batch-fix spawn runs **in-process** from `serve` (TS model).
+`serve` listens after POSIX `flock` + SQLite open and serves the console HTTP contract (inventory, intake, batches, search). `healthcheck` GETs `HOST:PORT/health` and exits 0 only when HTTP 200 **and** `ok: true`. The `worker` **subcommand** is still reserved (exit 1); batch-fix spawn runs **in-process** from `serve`.
 
 ## Run
 
@@ -18,7 +18,7 @@ cd /Users/joe/workspace/defect-drainer/backend-go
 go test ./...
 go run ./cmd/defect-drainer serve
 # → http://127.0.0.1:8788
-# DEFECTS_ROOT = umbrella; DEFECT_DRAINER_DATA = ../backend/.data when that DB exists.
+# DEFECTS_ROOT = umbrella; DEFECT_DRAINER_DATA = this module's .data when that DB exists.
 ```
 
 Or `make serve` / `make test` / `make build` (`CGO_ENABLED=0`). Cross-compile: `make cross-linux`.
@@ -40,13 +40,13 @@ The inventory is **one SQLite file** plus umbrella `evidence/`. Only one backend
 
 Legacy `DEFECT_CHANNEL_*` is still read. `.env` is only `backend-go/.env`, loaded in `main()`, never overriding process env.
 
-If those roots cannot be resolved (PATH-installed binary, no `go.mod` in cwd, no existing sibling `backend/.data/defect-drainer.db`), the process **exits 1**. It will not mkdir a second inventory.
+If those roots cannot be resolved (PATH-installed binary, no `go.mod` in cwd, no existing `backend-go/.data/defect-drainer.db`), the process **exits 1**. It will not mkdir a second inventory.
 
 From `backend-go/` in this umbrella, `serve` already picks that SSOT. Override only when the binary cannot see the tree:
 
 ```bash
 export DEFECTS_ROOT=/Users/joe/workspace/defect-drainer
-export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend/.data
+export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend-go/.data
 ```
 
 `healthcheck` uses **HOST/PORT only** (default `127.0.0.1:8788`). It does not walk `go.mod`, flock, or open SQLite.
@@ -80,7 +80,7 @@ The verification runner is **not sandboxed**. Commands come only from App Settin
 
 ## Related
 
-- Rollback API: `../backend/` (`defect-drainer-backend`) — stop Go first
+- Retired TS API: `defect-drainer-backend` remote only — the `../backend/` tree was deleted 2026-09-22
 - Operator UI: `../console/` (React/Vite; Node is build-time only)
 - Umbrella status: `../tasks/todo.md`
 

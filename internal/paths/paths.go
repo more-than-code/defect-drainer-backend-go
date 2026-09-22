@@ -15,6 +15,13 @@ const ModulePath = "github.com/joe/defect-drainer-go"
 
 const dbFileName = "defect-drainer.db"
 
+// The inventory data dir and the directory that holds it inside the umbrella.
+// Both moved out of the retired TS tree (`backend/.data`) on 2026-09-22.
+const (
+	dataDirName     = ".data"
+	goModuleDirName = "backend-go"
+)
+
 // Roots are the inventory and runtime directories for serve.
 type Roots struct {
 	DefectsRoot string
@@ -83,9 +90,11 @@ func Resolve(opts Options) (Roots, error) {
 			defects = umbrella
 		}
 		if data == "" {
-			sibling := filepath.Join(umbrella, "backend", ".data")
-			if fileExists(filepath.Join(sibling, dbFileName)) {
-				data = sibling
+			// The data dir lives inside this module since the TS tree was
+			// retired (2026-09-22); it used to be the sibling backend/.data.
+			own := filepath.Join(moduleRoot, dataDirName)
+			if fileExists(filepath.Join(own, dbFileName)) {
+				data = own
 			}
 		}
 	}
@@ -96,7 +105,7 @@ func Resolve(opts Options) (Roots, error) {
 				defects = u
 			}
 			if data == "" {
-				data = filepath.Join(u, "backend", ".data")
+				data = filepath.Join(u, goModuleDirName, dataDirName)
 			}
 		}
 	}
@@ -110,7 +119,7 @@ func Resolve(opts Options) (Roots, error) {
 func findUmbrella(start string) string {
 	dir := start
 	for {
-		if dirExists(filepath.Join(dir, "evidence")) && fileExists(filepath.Join(dir, "backend", ".data", dbFileName)) {
+		if dirExists(filepath.Join(dir, "evidence")) && fileExists(filepath.Join(dir, goModuleDirName, dataDirName, dbFileName)) {
 			return dir
 		}
 		parent := filepath.Dir(dir)

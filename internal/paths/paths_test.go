@@ -68,11 +68,13 @@ func TestResolveEnvWins(t *testing.T) {
 	}
 }
 
-func TestResolveSiblingDBWhenModuleFound(t *testing.T) {
+func TestResolveModuleDataWhenModuleFound(t *testing.T) {
 	clearRootEnv(t)
 	root := t.TempDir()
 	mod := filepath.Join(root, "backend-go")
-	data := filepath.Join(root, "backend", ".data")
+	// Data lives inside the module since the TS tree was retired; it used to
+	// be the sibling backend/.data.
+	data := filepath.Join(mod, ".data")
 	if err := os.MkdirAll(mod, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +101,7 @@ func TestResolveSiblingDBWhenModuleFound(t *testing.T) {
 	}
 }
 
-func TestResolveModuleWithoutSiblingDBDoesNotInventData(t *testing.T) {
+func TestResolveModuleWithoutDBDoesNotInventData(t *testing.T) {
 	clearRootEnv(t)
 	root := t.TempDir()
 	mod := filepath.Join(root, "backend-go")
@@ -109,7 +111,7 @@ func TestResolveModuleWithoutSiblingDBDoesNotInventData(t *testing.T) {
 	writeGoMod(t, mod)
 	_, err := Resolve(Options{Cwd: mod})
 	if err == nil {
-		t.Fatal("expected fail-closed when sibling db is missing")
+		t.Fatal("expected fail-closed when the module db is missing")
 	}
 	if _, statErr := os.Stat(filepath.Join(mod, ".data")); !os.IsNotExist(statErr) {
 		t.Fatalf("must not create module .data: %v", statErr)
@@ -122,7 +124,7 @@ func TestResolveUmbrellaCwdHeuristic(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "evidence"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	data := filepath.Join(root, "backend", ".data")
+	data := filepath.Join(root, "backend-go", ".data")
 	if err := os.MkdirAll(data, 0o755); err != nil {
 		t.Fatal(err)
 	}
