@@ -130,6 +130,29 @@ ledger is `NOTES.md`, not `tasks/todo.md`. Completion is measured in files:
 lines `UNFIXED: <id>` to decline a defect and `NO-SCREENSHOT: <id>` where the
 sandbox blocks capture. A `DONE` reply without those files is ignored.
 
+Since PR-H2 the harness *enforces* that rather than merely asking. The spawn is a
+driver loop, not one shot: after each iteration DD checks the handoff for those
+files and resumes the session (`grok -c` with a fixed continue prompt, never one
+the model wrote) until they exist or a cap ends it — 8 iterations and 45 minutes
+of agent wall by default, both overridable per deployment. Output is
+`streaming-json`, so DD reads the `end` event's `stopReason`, turn count and cost
+instead of guessing from an exit status.
+
+That distinction matters because exit code 0 means two different things: "I
+finished" and "I ran out of turns mid-plan". Worse, **turn exhaustion exits
+non-zero** (verified on Grok Build 1.0.40: exit 1, `stopReason: cancelled`, plus a
+`max_turns_reached` event), so a harness that failed the job on any non-zero exit
+would give up exactly when it should resume. DD branches on the event, not the
+exit code: `max_turns_reached` resumes, anything else non-zero is a real failure
+that stops the loop and resolves nothing.
+
+Stopping the loop is not permission to resolve. `agentRun.completedByArtifacts`
+records whether the worker actually delivered, and harvest keeps its own gates on
+top: a defect resolves only with an image imported **by this run** — prose plus a
+screenshot from a previous job no longer counts — and only when verification
+shows no regression. A failed or cancelled run harvests its evidence and notes so
+nothing is lost, and resolves nothing.
+
 ---
 
 ## Surfaces

@@ -303,3 +303,62 @@ func TestStartCodingAgentMarksWorkerRole(t *testing.T) {
 		t.Fatalf("worktree enforcement block dropped:\n%s", s)
 	}
 }
+
+func TestStartCodingAgentMaxTurnsPrecedence(t *testing.T) {
+	run := func(t *testing.T, opts *CodingAgentOpts) string {
+		t.Helper()
+		out := filepath.Join(t.TempDir(), "args.txt")
+		bin := filepath.Join(t.TempDir(), "fake-grok")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + out + "\"\nexit 0\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GROK_BUILD_BIN", bin)
+		wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
+		cmd, flush, err := StartCodingAgent(t.TempDir(), "BATCH-turns", t.TempDir(), wts, "strict", nil, nil, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if flush != nil {
+			flush()
+		}
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return argvFlagValue(string(got), "--max-turns")
+	}
+
+	t.Run("unset falls back to the built-in default", func(t *testing.T) {
+		t.Setenv("DEFECT_DRAINER_GROK_BATCH_MAX_TURNS", "")
+		t.Setenv("GROK_BATCH_MAX_TURNS", "")
+		if got := run(t, nil); got != defaultBatchMaxTurns {
+			t.Fatalf("--max-turns = %q, want %q", got, defaultBatchMaxTurns)
+		}
+	})
+
+	t.Run("app setting wins over env", func(t *testing.T) {
+		t.Setenv("GROK_BATCH_MAX_TURNS", "120")
+		if got := run(t, &CodingAgentOpts{MaxTurns: 300}); got != "300" {
+			t.Fatalf("--max-turns = %q, want 300 (app setting outranks env)", got)
+		}
+	})
+
+	t.Run("env used when the app leaves it unset", func(t *testing.T) {
+		t.Setenv("GROK_BATCH_MAX_TURNS", "120")
+		if got := run(t, &CodingAgentOpts{MaxTurns: 0}); got != "120" {
+			t.Fatalf("--max-turns = %q, want 120", got)
+		}
+	})
+
+	t.Run("a non-positive app value never reaches argv", func(t *testing.T) {
+		t.Setenv("DEFECT_DRAINER_GROK_BATCH_MAX_TURNS", "")
+		t.Setenv("GROK_BATCH_MAX_TURNS", "")
+		if got := run(t, &CodingAgentOpts{MaxTurns: -7}); got != defaultBatchMaxTurns {
+			t.Fatalf("--max-turns = %q, want the default", got)
+		}
+	})
+}

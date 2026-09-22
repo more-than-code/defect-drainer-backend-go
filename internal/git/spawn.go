@@ -2,10 +2,12 @@ package git
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -171,10 +173,40 @@ func (f *lineForwarder) Flush() {
 }
 
 // VerifySpec is one operator verification command, for the spawn prompt only.
+// defaultBatchMaxTurns is the fallback when neither App Settings nor the env
+// sets one. Kept as the historical value so an unset app behaves as before.
+const defaultBatchMaxTurns = "80"
+
 type VerifySpec struct {
 	Repo    string
 	Command string
 }
+
+// AgentEnd is the streaming-json `end` event. Field names verified against
+// Grok Build 1.0.40 (2026-09-22) and deliberately mixed-case: stopReason and
+// sessionId are camel, num_turns and total_cost_usd are snake. stopReason is
+// snake_case *values* since 1.0 (`end_turn`, `cancelled`) — a driver loop
+// matching the pre-1.0 `EndTurn` matches nothing and loops until its cap.
+type AgentEnd struct {
+	StopReason   string  `json:"stopReason"`
+	SessionID    string  `json:"sessionId"`
+	NumTurns     int     `json:"num_turns"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+}
+
+// ContinuePrompt resumes an iteration. It is a code constant, never
+// model-authored: the worker may not widen its own completion contract, and the
+// marker spellings here are the ones artifactsComplete matches exactly.
+const ContinuePrompt = `Continue executing BRIEF.md and PROCESS.md. Resume where you left off.
+Do not stop early. Required artifacts (exact; Defect Drainer matches these, not prose):
+- NOTES.md
+- for each defect you claim fixed: fix-notes/<DEF-id>.md AND
+  fix-evidence/<DEF-id>/fix-01.png
+- to decline a defect, a full line in NOTES.md: UNFIXED: <DEF-id>
+- if the sandbox is strict and you cannot screenshot, a full line:
+  NO-SCREENSHOT: <DEF-id>
+  (that stops the loop only; harvest will not resolve without a new image)
+Do not invent other marker spellings. Do not delegate onward.`
 
 // CodingAgentOpts is extra spawn wiring (toolchain PATH, job-scoped sandbox
 // profile, prompt notes). Nil is a no-op.
@@ -184,6 +216,133 @@ type CodingAgentOpts struct {
 	ToolchainNotes []string
 	VerifyCommands []VerifySpec
 	AlreadyFailing []string
+	// Continue resumes the most recent session for this cwd (-c) with
+	// ContinuePrompt instead of sending the full brief prompt again.
+	Continue bool
+	// OnEnd receives the `end` event; OnMaxTurns fires on the separate
+	// max_turns_reached event, which is how turn exhaustion is told apart from
+	// a genuine failure (both exit non-zero).
+	OnEnd      func(AgentEnd)
+	OnMaxTurns func()
+	// MaxTurns is the app's configured turn cap. Zero falls back to the env
+	// override, then the built-in default.
+	MaxTurns int
+}
+
+// agentStream parses streaming-json (NDJSON) stdout **before** lineForwarder
+// sees it. The order is load-bearing: lineForwarder caps a line at maxLogBlock
+// mid-line, so unmarshalling its output would slice a JSON object in half, put
+// thoughts in the job log before they could be filtered, and could lose the
+// `end` event entirely. Every raw byte still reaches agent.log.
+type agentStream struct {
+	raw        io.Writer
+	text       *lineForwarder
+	errs       *lineForwarder
+	onEnd      func(AgentEnd)
+	onMaxTurns func()
+	pend       []byte
+}
+
+func (a *agentStream) Write(p []byte) (int, error) {
+	if a.raw != nil {
+		_, _ = a.raw.Write(p)
+	}
+	a.pend = append(a.pend, p...)
+	for {
+		i := bytes.IndexByte(a.pend, '\n')
+		if i < 0 {
+			// A child dumping a huge blob with no newline must not grow this
+			// buffer without bound. Drop it with a marker rather than unmarshal.
+			if len(a.pend) > maxAgentLogBytes {
+				a.emit(a.text, logTruncateMark)
+				a.pend = a.pend[:0]
+			}
+			break
+		}
+		line := append([]byte(nil), a.pend[:i]...)
+		a.pend = a.pend[i+1:]
+		a.handle(line)
+	}
+	return len(p), nil
+}
+
+func (a *agentStream) emit(f *lineForwarder, line string) {
+	if f == nil || line == "" {
+		return
+	}
+	_, _ = f.Write([]byte(line + "\n"))
+}
+
+func (a *agentStream) handle(line []byte) {
+	t := bytes.TrimSpace(line)
+	if len(t) == 0 {
+		return
+	}
+	// Non-JSON: an older CLI, or a fake bin in tests that echoes argv. Keep it
+	// as an ordinary log line rather than discarding the run's only output.
+	if t[0] != '{' {
+		a.emit(a.text, string(t))
+		return
+	}
+	var ev struct {
+		Type    string `json:"type"`
+		Text    string `json:"text"`
+		Message string `json:"message"`
+		Content string `json:"content"`
+		AgentEnd
+	}
+	if err := json.Unmarshal(t, &ev); err != nil {
+		a.emit(a.text, string(t))
+		return
+	}
+	switch ev.Type {
+	case "text":
+		// The `end` shape is verified against 1.0.40; this payload field is
+		// not, so fall back through the candidates and finally to the raw line.
+		// Losing the agent's output to a field-name guess is worse than noise.
+		payload := ev.Text
+		if payload == "" {
+			payload = ev.Message
+		}
+		if payload == "" {
+			payload = ev.Content
+		}
+		if payload == "" {
+			payload = string(t)
+		}
+		a.emit(a.text, payload)
+	case "thought":
+		// agent.log only. Reasoning is not the operator's job log.
+	case "end":
+		if a.onEnd != nil {
+			a.onEnd(ev.AgentEnd)
+		}
+	case "max_turns_reached":
+		// The positive signal for turn exhaustion, which also exits non-zero.
+		if a.onMaxTurns != nil {
+			a.onMaxTurns()
+		}
+	case "error":
+		msg := ev.Message
+		if msg == "" {
+			msg = string(t)
+		}
+		a.emit(a.errs, "agent error: "+msg)
+	default:
+		// tool_call, tool_call_update, usage, available_commands, and whatever
+		// a later version adds. agent.log keeps them; job.log stays readable.
+	}
+}
+
+// Flush handles a trailing line with no newline, so a final `end` on a stream
+// that does not end in \n is still recorded.
+func (a *agentStream) Flush() {
+	if len(a.pend) == 0 {
+		return
+	}
+	line := a.pend
+	a.pend = nil
+	a.handle(line)
 }
 
 func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, worktrees []WorktreeBinding, opts *CodingAgentOpts) string {
@@ -320,22 +479,42 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		sandboxArg = opts.SandboxProfile
 	}
 	prompt := buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox, worktrees, opts)
-	maxTurns := env.EnvDrainer("GROK_BATCH_MAX_TURNS")
+	// App Settings wins, then either env spelling, then the built-in default.
+	// A Flutter repo burns turns far faster than a Node one — each pub get,
+	// analyze and test is a turn — so this is per app, not per install.
+	maxTurns := ""
+	if opts != nil && opts.MaxTurns > 0 {
+		maxTurns = strconv.Itoa(opts.MaxTurns)
+	}
+	if maxTurns == "" {
+		maxTurns = env.EnvDrainer("GROK_BATCH_MAX_TURNS")
+	}
 	if maxTurns == "" {
 		maxTurns = os.Getenv("GROK_BATCH_MAX_TURNS")
 	}
 	if maxTurns == "" {
-		maxTurns = "80"
+		maxTurns = defaultBatchMaxTurns
 	}
-	args := []string{
-		"-p", prompt,
+	// Iteration 2+ resumes the session for this cwd with the fixed continue
+	// prompt. Everything else about the argv is identical, so the sandbox and
+	// turn budget cannot drift between iterations.
+	args := []string{}
+	promptArg := prompt
+	if opts != nil && opts.Continue {
+		promptArg = ContinuePrompt
+		args = append(args, "-c")
+	}
+	args = append(args,
+		"-p", promptArg,
 		"--cwd", handoffAbs,
 		"--sandbox", sandboxArg,
 		"--always-approve",
 		"--max-turns", maxTurns,
-		"--output-format", "plain",
+		// streaming-json, not plain: plain prints prose at exit and hides
+		// stopReason, so the harness cannot tell turn exhaustion from a finish.
+		"--output-format", "streaming-json",
 		"--verbatim",
-	}
+	)
 	if env.EnvDrainerFlag("GROK_BYPASS_PERMISSIONS") {
 		args = append(args, "--permission-mode", "bypassPermissions")
 	}
@@ -367,6 +546,11 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	cmd.Env = append(cmd.Env, "DEFECT_DRAINER_WORKTREES="+strings.Join(wtPaths, ":"))
 	outFwd := newLineForwarder(onStdout)
 	errFwd := newLineForwarder(onStderr)
+	stream := &agentStream{text: outFwd, errs: errFwd}
+	if opts != nil {
+		stream.onEnd = opts.OnEnd
+		stream.onMaxTurns = opts.OnMaxTurns
+	}
 	logf, err := os.OpenFile(handoffAbs+"/agent.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err == nil {
 		var start int64
@@ -374,13 +558,17 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 			start = st.Size()
 		}
 		tee := &cappedWriter{w: logf, n: start, limit: maxAgentLogBytes}
-		cmd.Stdout = io.MultiWriter(tee, outFwd)
+		// stdout is NDJSON and goes through the parser, which owns the raw tee.
+		// stderr is plain text and keeps the old path.
+		stream.raw = tee
+		cmd.Stdout = stream
 		cmd.Stderr = io.MultiWriter(tee, errFwd)
 	} else {
-		cmd.Stdout = outFwd
+		cmd.Stdout = stream
 		cmd.Stderr = errFwd
 	}
 	flush := func() {
+		stream.Flush()
 		outFwd.Flush()
 		errFwd.Flush()
 		if logf != nil {

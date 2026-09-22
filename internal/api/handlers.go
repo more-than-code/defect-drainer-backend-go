@@ -80,6 +80,11 @@ func appFromMap(b map[string]any) store.AppRecord {
 	if raw, ok := b["verify_commands"]; ok {
 		rec.VerifyCommands = parseVerifyCommands(raw)
 	}
+	// JSON numbers decode as float64; a non-number (or junk) leaves the field
+	// unset, which the store reads as "use the server default".
+	if v, ok := b["agent_max_turns"].(float64); ok {
+		rec.AgentMaxTurns = int(v)
+	}
 	rec.BaseRemote, _ = b["base_remote"].(string)
 	rec.BaseBranch, _ = b["base_branch"].(string)
 	if v, ok := b["default"].(bool); ok {

@@ -1162,3 +1162,87 @@ func TestBatchJobDiffEndpoint(t *testing.T) {
 		t.Fatalf("kind=all missing both kinds: %s", okAll.Body)
 	}
 }
+
+// The turn cap is an operator-facing App Settings field: it has to survive a
+// PATCH round-trip, clamp hostile input, and stay absent when unset so an
+// existing app keeps the server default.
+func TestAppAgentMaxTurnsRoundTrip(t *testing.T) {
+	app := testApp(t)
+	h := app.Handler
+
+	rec := doJSON(t, h, "POST", "/api/apps", map[string]any{"name": "turns-app", "repos": []string{"demo"}})
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		t.Fatalf("create app: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		App struct {
+			ID            string `json:"id"`
+			AgentMaxTurns int    `json:"agent_max_turns"`
+		} `json:"app"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	id := created.App.ID
+	if id == "" {
+		t.Fatalf("no app id in %s", rec.Body.String())
+	}
+	if created.App.AgentMaxTurns != 0 {
+		t.Fatalf("a new app must default to unset, got %d", created.App.AgentMaxTurns)
+	}
+
+	read := func(t *testing.T) int {
+		t.Helper()
+		rec := doJSON(t, h, "GET", "/api/apps", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list apps: %d", rec.Code)
+		}
+		var got struct {
+			Apps []struct {
+				ID            string `json:"id"`
+				AgentMaxTurns int    `json:"agent_max_turns"`
+			} `json:"apps"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range got.Apps {
+			if a.ID == id {
+				return a.AgentMaxTurns
+			}
+		}
+		t.Fatalf("app %s missing from list", id)
+		return -1
+	}
+
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"agent_max_turns": 240}); rec.Code != http.StatusOK {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := read(t); got != 240 {
+		t.Fatalf("after patch = %d, want 240", got)
+	}
+
+	// An unrelated PATCH must not silently clear it.
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"description": "unrelated"}); rec.Code != http.StatusOK {
+		t.Fatalf("patch 2: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := read(t); got != 240 {
+		t.Fatalf("unrelated patch cleared the cap: %d", got)
+	}
+
+	// A fat-fingered value is clamped, not honoured.
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"agent_max_turns": 9999999}); rec.Code != http.StatusOK {
+		t.Fatalf("patch 3: %d", rec.Code)
+	}
+	if got := read(t); got != store.AgentMaxTurnsLimit {
+		t.Fatalf("hostile value not clamped: %d", got)
+	}
+
+	// Explicitly back to unset.
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"agent_max_turns": 0}); rec.Code != http.StatusOK {
+		t.Fatalf("patch 4: %d", rec.Code)
+	}
+	if got := read(t); got != 0 {
+		t.Fatalf("could not return to unset: %d", got)
+	}
+}

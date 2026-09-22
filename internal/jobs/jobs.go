@@ -20,6 +20,7 @@ import (
 
 	"github.com/joe/defect-drainer-go/internal/analytics"
 	"github.com/joe/defect-drainer-go/internal/db"
+	"github.com/joe/defect-drainer-go/internal/env"
 	"github.com/joe/defect-drainer-go/internal/git"
 	"github.com/joe/defect-drainer-go/internal/paths"
 	"github.com/joe/defect-drainer-go/internal/store"
@@ -47,6 +48,7 @@ type Job struct {
 	Verification *VerificationRun      `json:"verification,omitempty"`
 	Baseline     *VerificationRun      `json:"baseline,omitempty"`
 	DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
+	AgentRun     *AgentRun             `json:"agentRun,omitempty"`
 	Log          []string              `json:"log,omitempty"`
 	Source       string                `json:"source,omitempty"`
 	DefectPath   string                `json:"defectPath,omitempty"`
@@ -64,7 +66,8 @@ var jobOwnedJSON = map[string]bool{
 	"error": true, "handoffPath": true, "createdAt": true, "updatedAt": true,
 	"comment": true, "reporter": true, "prs": true, "worktrees": true,
 	"verification": true, "baseline": true, "diffHygiene": true,
-	"log": true, "source": true, "defectPath": true,
+	"agentRun": true,
+	"log":      true, "source": true, "defectPath": true,
 	"severity": true, "client": true, "surface": true,
 }
 
@@ -137,6 +140,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		Verification *VerificationRun      `json:"verification,omitempty"`
 		Baseline     *VerificationRun      `json:"baseline,omitempty"`
 		DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
+		AgentRun     *AgentRun             `json:"agentRun,omitempty"`
 		Log          []string              `json:"log,omitempty"`
 		Source       string                `json:"source,omitempty"`
 		DefectPath   string                `json:"defectPath,omitempty"`
@@ -151,7 +155,8 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt, Comment: j.Comment,
 		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees,
 		Verification: j.Verification, Baseline: j.Baseline, DiffHygiene: j.DiffHygiene,
-		Log: j.Log, Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
+		AgentRun: j.AgentRun,
+		Log:      j.Log, Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
 		Client: j.Client, Surface: j.Surface,
 	})
 	if err != nil {
@@ -371,6 +376,16 @@ func cloneJob(j *Job) *Job {
 			v.Results = append([]VerifyResult(nil), j.Baseline.Results...)
 		}
 		c.Baseline = &v
+	}
+	if j.AgentRun != nil {
+		a := *j.AgentRun
+		if j.AgentRun.StopReasons != nil {
+			a.StopReasons = append([]string(nil), j.AgentRun.StopReasons...)
+		}
+		if j.AgentRun.Missing != nil {
+			a.Missing = append([]string(nil), j.AgentRun.Missing...)
+		}
+		c.AgentRun = &a
 	}
 	if j.DiffHygiene != nil {
 		d := *j.DiffHygiene
@@ -709,7 +724,12 @@ type BatchRunner struct {
 	mu        sync.Mutex
 	persistMu sync.Mutex
 	persist   map[string]*sync.Mutex
-	starting     map[string]chan struct{}
+	starting  map[string]chan struct{}
+	// looping stays open for the whole driver-loop goroutine, not just the
+	// first Start. Between reaping one iteration and starting the next,
+	// procs[jobID] is empty, so Stop's signal is a no-op and DeleteJob would
+	// otherwise RemoveAll the handoff out from under the next child.
+	looping      map[string]chan struct{}
 	verifyCancel map[string]context.CancelFunc
 	store        *store.Store
 	dataRoot     string
@@ -972,9 +992,12 @@ func (b *BatchRunner) persistLive(id string) error {
 func (b *BatchRunner) DeleteJob(id string) error {
 	b.mu.Lock()
 	slot := b.procs[id]
-	var startDone chan struct{}
+	var startDone, loopDone chan struct{}
 	if b.starting != nil {
 		startDone = b.starting[id]
+	}
+	if b.looping != nil {
+		loopDone = b.looping[id]
 	}
 	delete(b.jobs, id)
 	delete(b.procs, id)
@@ -992,6 +1015,11 @@ func (b *BatchRunner) DeleteJob(id string) error {
 	}
 	if startDone != nil {
 		<-startDone
+	}
+	// The loop goroutine may be between iterations with no process handle; wait
+	// for it to observe the deleted job and return before removing the dir.
+	if loopDone != nil {
+		<-loopDone
 	}
 	if b.store != nil {
 		analytics.DeleteJobSummary(b.store.DB, id)
@@ -1095,6 +1123,10 @@ func (b *BatchRunner) appendLog(j *Job, line, level, source string) {
 // keeps evidence-only resolve (failed-agent harvest and jobs with no commands).
 type HarvestOpts struct {
 	Verification *VerificationRun
+	// AllowResolve must be set explicitly for a defect to resolve. The zero
+	// value denies: a failed, cancelled or capped run harvests its evidence and
+	// notes but resolves nothing, so nil opts can never resolve by accident.
+	AllowResolve bool
 }
 
 var imageExts = map[string]bool{
@@ -1229,9 +1261,12 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 		harvestStartHook()
 	}
 	var verification *VerificationRun
+	allowResolve := false
 	if opts != nil {
 		verification = opts.Verification
+		allowResolve = opts.AllowResolve
 	}
+	resolveDenyReason := "this run may not resolve (failed, cancelled, or incomplete artifacts)"
 	fixRoot := filepath.Join(handoff, "fix-evidence")
 	notesRoot := filepath.Join(handoff, "fix-notes")
 	imported := 0
@@ -1250,13 +1285,11 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 		if ents, err := os.ReadDir(imgDir); err == nil && isRealDir(imgDir) {
 			for _, e := range ents {
 				name := e.Name()
-				// DirEntry.IsDir follows the link, so a symlinked directory
-				// would read as a file here; readRegularFile is the real gate.
-				if strings.HasPrefix(name, ".") || e.IsDir() {
-					continue
-				}
-				ext := strings.ToLower(filepath.Ext(name))
-				if !imageExts[ext] {
+				// Shared with artifactsComplete so the driver loop can never
+				// stop on a file this harvest would then skip. DirEntry.IsDir
+				// follows the link, so a symlinked directory would read as a
+				// file here; readRegularFile is the real gate.
+				if !harvestableImageName(name, e.IsDir()) {
 					continue
 				}
 				data, tooLarge, ok := readRegularFile(handoff, filepath.Join(imgDir, name), cutoff)
@@ -1317,7 +1350,11 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 			continue
 		}
 
-		if len(cur.FixEvidence) > 0 {
+		// Resolve on evidence imported by THIS run. Historical fix_evidence on
+		// the defect is not proof that this job fixed anything — accepting it
+		// is how a job with notes and a screenshot from a previous run used to
+		// resolve a defect it never touched.
+		if len(files) > 0 && allowResolve {
 			res := note
 			if res == "" {
 				res = cur.Resolution
@@ -1337,7 +1374,11 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 			b.appendLog(job, "harvest "+defectID+": resolved with fix_evidence", "info", "DefectDrainer")
 		} else if note != "" {
 			_, _ = b.store.Update(defectID, store.DefectRecord{Resolution: note}, map[string]bool{"resolution": true})
-			b.appendLog(job, "harvest "+defectID+": notes only (no images) — still needs screenshots", "warn", "DefectDrainer")
+			if len(files) > 0 {
+				b.appendLog(job, "harvest "+defectID+": fix image(s) imported but NOT resolved — "+resolveDenyReason, "warn", "DefectDrainer")
+			} else {
+				b.appendLog(job, "harvest "+defectID+": notes only (no images) — still needs screenshots", "warn", "DefectDrainer")
+			}
 		}
 	}
 	b.appendLog(job, fmt.Sprintf("harvest done: %d image(s), %d/%d resolved", imported, resolved, len(job.DefectIDs)), "info", "DefectDrainer")
@@ -1481,11 +1522,16 @@ func unixSignalName(sig os.Signal) string {
 // that installs procs[id] — a live child exists but is still untracked.
 // harvestStartHook runs at the top of harvestFixEvidence so a test can delete
 // while harvest still holds the live *Job pointer.
+// loopBeforeNextHook runs in the driver loop after an iteration is reaped and
+// the decision to continue is made, but before the next child starts — the gap
+// where no process handle exists. Tests use it to make Stop/Delete land there
+// deterministically instead of racing a sleep.
 // spawnExitHook runs when the completion goroutine returns.
 var (
 	startSpawnHook           func()
 	startSpawnAfterStartHook func()
 	harvestStartHook         func()
+	loopBeforeNextHook       func()
 	spawnExitHook            func()
 )
 
@@ -1566,18 +1612,24 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 	sandbox := "strict"
 	toolchainKind := "none"
 	simWrites := false
+	maxTurns := 0
 	var verifyCommands []store.VerifyCommand
 	var repoEntries []store.AppRepoEntry
 	if app != nil {
 		sandbox = store.ParseGrokSandbox(app.GrokSandbox)
 		toolchainKind = store.ParseAgentToolchain(app.AgentToolchain)
 		simWrites = app.AllowSimulatorWrites
+		maxTurns = store.NormalizeAgentMaxTurns(app.AgentMaxTurns)
 		verifyCommands = store.NormalizeVerifyCommands(app.VerifyCommands)
 		repoEntries = app.RepoEntries
 	}
 	_ = os.MkdirAll(filepath.Join(handoff, "fix-evidence"), 0o755)
 	_ = os.MkdirAll(filepath.Join(handoff, "fix-notes"), 0o755)
-	b.appendLog(&jobCopy, fmt.Sprintf("app %s grok_sandbox=%s agent_toolchain=%s", appID, sandbox, toolchainKind), "info", "DefectDrainer")
+	turnsNote := "default"
+	if maxTurns > 0 {
+		turnsNote = strconv.Itoa(maxTurns)
+	}
+	b.appendLog(&jobCopy, fmt.Sprintf("app %s grok_sandbox=%s agent_toolchain=%s agent_max_turns=%s", appID, sandbox, toolchainKind, turnsNote), "info", "DefectDrainer")
 
 	spawnLog := func(line, level string) {
 		b.appendLog(&Job{ID: jobID}, line, level, "DefectDrainer")
@@ -1638,16 +1690,33 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 		verifySpecs = append(verifySpecs, git.VerifySpec{Repo: v.Repo, Command: v.Command})
 	}
 	notes := append(append([]string{}, provisioned.Notes...), profileNotes...)
-	cmd, flush, err := git.StartCodingAgent(handoff, batchID, defectsRoot, wts, sandbox, onStdout, onStderr, &git.CodingAgentOpts{
-		ExtraEnv:       provisioned.Env,
-		SandboxProfile: sandboxProfile,
-		ToolchainNotes: notes,
-		VerifyCommands: verifySpecs,
-		AlreadyFailing: alreadyFailingLines(baseline),
-	})
+	acc := &agentRunAcc{}
+	// Every iteration uses identical argv except for -c + the continue prompt,
+	// so the sandbox and turn budget cannot drift between them.
+	startIter := func(resume bool) (*exec.Cmd, func(), error) {
+		return git.StartCodingAgent(handoff, batchID, defectsRoot, wts, sandbox, onStdout, onStderr, &git.CodingAgentOpts{
+			ExtraEnv:       provisioned.Env,
+			SandboxProfile: sandboxProfile,
+			ToolchainNotes: notes,
+			VerifyCommands: verifySpecs,
+			AlreadyFailing: alreadyFailingLines(baseline),
+			MaxTurns:       maxTurns,
+			Continue:       resume,
+			OnEnd: func(e git.AgentEnd) {
+				acc.end(e.StopReason, e.SessionID, e.NumTurns, e.TotalCostUSD)
+			},
+			OnMaxTurns: acc.maxTurnsReached,
+		})
+	}
+	cmd, flush, err := startIter(false)
 	if err != nil {
 		return err
 	}
+	// The wall clock starts here — at iter-1 Start, not at StartSpawn. Baseline
+	// is 20 min per command on its own clock and must not eat the agent budget.
+	loopStart := time.Now()
+	maxIters := parsePositiveInt(env.EnvDrainer("AGENT_MAX_ITERS"), defaultAgentMaxIters)
+	maxWall := time.Duration(parsePositiveInt(env.EnvDrainer("AGENT_MAX_WALL_SEC"), defaultAgentMaxWallSec)) * time.Second
 	if startSpawnAfterStartHook != nil {
 		startSpawnAfterStartHook()
 	}
@@ -1672,28 +1741,128 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 	b.mu.Unlock()
 	b.persistLive(jobID)
 	launched = true
+	loopDone := make(chan struct{})
+	b.mu.Lock()
+	if b.looping == nil {
+		b.looping = map[string]chan struct{}{}
+	}
+	b.looping[jobID] = loopDone
+	b.mu.Unlock()
 	go func() {
+		// endLoop releases DeleteJob as soon as no further child can start. It
+		// deliberately does NOT span verify and harvest: the gap this guards is
+		// between reaping one iteration and starting the next, and holding it
+		// through verify would block DeleteJob behind commands that are allowed
+		// 20 minutes each — and deadlock against a harvest that waits on the
+		// deleting goroutine.
+		var closeLoopOnce sync.Once
+		endLoop := func() {
+			closeLoopOnce.Do(func() {
+				b.mu.Lock()
+				if b.looping[jobID] == loopDone {
+					delete(b.looping, jobID)
+				}
+				b.mu.Unlock()
+				close(loopDone)
+			})
+		}
 		defer func() {
+			endLoop()
 			if spawnExitHook != nil {
 				spawnExitHook()
 			}
 			b.callVerifyCancel(jobID)
 		}()
-		err := proc.reap()
-		if flush != nil {
-			flush()
+
+		// Driver loop: completion is the artifacts BRIEF.md demands, not the
+		// child's exit code (K6). A non-zero exit carrying max_turns_reached is
+		// turn exhaustion and resumes; anything else non-zero is a real failure.
+		curProc, curFlush := proc, flush
+		iter := 1
+		stoppedBy := ""
+		var missing []string
+		var exitErr error
+		cutoff := harvestCutoff(&jobCopy)
+		for {
+			exitErr = curProc.reap()
+			if curFlush != nil {
+				curFlush()
+			}
+			sawMaxTurns := acc.takeMaxTurns()
+			b.mu.Lock()
+			delete(b.procs, jobID)
+			gone := jobGoneOrCancelled(b.jobs[jobID])
+			b.mu.Unlock()
+			if gone {
+				return
+			}
+
+			complete, miss := artifactsComplete(handoff, jobCopy.DefectIDs, sandbox, cutoff)
+			missing = miss
+			stoppedBy = nextLoopStop(iter, maxIters, time.Since(loopStart), maxWall, exitErr, sawMaxTurns, complete)
+
+			// Persist after every iteration so a killed loop still leaves its
+			// cost and stop reasons on disk.
+			b.mu.Lock()
+			if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
+				live.AgentRun = acc.snapshot(iter, stoppedBy, missing)
+				b.appendLogLocked(live, loopIterationLine(iter, exitErr, sawMaxTurns, complete, stoppedBy, missing), loopLevel(stoppedBy), "DefectDrainer")
+			}
+			b.mu.Unlock()
+			b.persistLive(jobID)
+			if stoppedBy != "" {
+				break
+			}
+
+			iter++
+			if loopBeforeNextHook != nil {
+				loopBeforeNextHook()
+			}
+			b.mu.Lock()
+			gone = jobGoneOrCancelled(b.jobs[jobID])
+			b.mu.Unlock()
+			if gone {
+				return
+			}
+			nextCmd, nextFlush, nerr := startIter(true)
+			if nerr != nil {
+				exitErr = nerr
+				stoppedBy = StoppedByExit
+				b.mu.Lock()
+				if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
+					live.AgentRun = acc.snapshot(iter, stoppedBy, missing)
+					b.appendLogLocked(live, "agent iteration "+strconv.Itoa(iter)+" failed to start: "+nerr.Error(), "error", "DefectDrainer")
+				}
+				b.mu.Unlock()
+				b.persistLive(jobID)
+				break
+			}
+			b.mu.Lock()
+			if jobGoneOrCancelled(b.jobs[jobID]) {
+				b.mu.Unlock()
+				abandonStartedAgent(nextCmd, nextFlush)
+				return
+			}
+			curProc = &spawnedProc{cmd: nextCmd}
+			b.procs[jobID] = curProc
+			curFlush = nextFlush
+			b.mu.Unlock()
 		}
+
+		// The loop is over; no further child will start, so a concurrent
+		// DeleteJob may proceed while verify and harvest run.
+		endLoop()
+
+		failed := stoppedBy == StoppedByExit
 		b.mu.Lock()
-		delete(b.procs, jobID)
 		live := b.jobs[jobID]
 		if jobGoneOrCancelled(live) {
 			b.mu.Unlock()
 			return
 		}
-		failed := err != nil
 		if failed {
 			live.Status = "failed"
-			live.Error = formatGrokExit(err)
+			live.Error = formatGrokExit(exitErr)
 			b.appendLogLocked(live, live.Error, "error", "DefectDrainer")
 		} else {
 			live.Error = ""
@@ -1726,7 +1895,7 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 			}
 			b.mu.Unlock()
 			b.persistLive(jobID)
-			harvestOpts = &HarvestOpts{Verification: &run}
+			harvestOpts = &HarvestOpts{Verification: &run, AllowResolve: true}
 		}
 		if j := b.GetJob(jobID); j == nil || jobGoneOrCancelled(j) {
 			return

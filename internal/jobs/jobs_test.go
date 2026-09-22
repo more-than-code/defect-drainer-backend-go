@@ -200,7 +200,7 @@ func TestHarvestResolvesWithImagesLeavesOpenWithout(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(imgDir, "notes.txt"), []byte("skip"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	br.harvestFixEvidence(job, handoff, nil)
+	br.harvestFixEvidence(job, handoff, &HarvestOpts{AllowResolve: true})
 
 	got, err := st.Get(fixed)
 	if err != nil || got == nil || got.Status != "resolved" {
@@ -1491,9 +1491,32 @@ func TestHarvestNilVerificationStillResolvesOnPNG(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(imgDir, "fix-01.png"), []byte("png"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	br.harvestFixEvidence(job, handoff, nil)
+	br.harvestFixEvidence(job, handoff, &HarvestOpts{AllowResolve: true})
 	got, err := st.Get(id)
 	if err != nil || got == nil || got.Status != "resolved" {
 		t.Fatalf("nil verification should still resolve on PNG, got %+v %v", got, err)
+	}
+	// AllowResolve is the separate axis: an unconfigured verification does not
+	// block, but a run that may not resolve still must not.
+	denied := "DEF-20260819-nilver-denied-01"
+	writeInProgressDefect(t, st, denied)
+	job.DefectIDs = []string{denied}
+	deniedDir := filepath.Join(handoff, "fix-evidence", denied)
+	if err := os.MkdirAll(deniedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deniedDir, "fix-01.png"), []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	br.harvestFixEvidence(job, handoff, &HarvestOpts{})
+	back, err := st.Get(denied)
+	if err != nil || back == nil {
+		t.Fatal(err)
+	}
+	if back.Status == "resolved" {
+		t.Fatalf("a run that may not resolve must not resolve: %+v", back)
+	}
+	if len(back.FixEvidence) == 0 {
+		t.Fatalf("evidence should still be imported when resolve is denied: %+v", back)
 	}
 }

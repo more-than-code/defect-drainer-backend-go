@@ -60,15 +60,32 @@ export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend-go/.data
 3. Persist bindings on `job.worktrees`. Empty worktrees refuse spawn.
 4. Write `BRIEF.md` (worker role, decisions, acceptance criteria, defects), the DD-owned `PROCESS.md` worker contract, the generated `SKILLS.md` (per-worktree contract files and `SKILL.md` entries from `.agents/skills` / `.claude/skills` / `.grok/skills` — name, one-line summary and path, never bodies), and the batch manifest. Fail-closed 400s still write all three so the handoff explains why spawn did not start.
 5. If `agent_toolchain=flutter`, clone the pinned SDK into `<handoff>/.tooling` (`cp -Rc`; skip + warn on missing/conflicting pins). If `allow_simulator_writes`, write a job-scoped `<handoff>/.grok/sandbox.toml` (`dd-simulator`) — never `~/.grok`. Record each worktree `HEAD`. If `verify_commands` is set, run them as **baseline** into `<handoff>/baseline` and persist `job.baseline`.
-6. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`) with `--sandbox` from the app `grok_sandbox` (`workspace` or `strict`), or `dd-simulator` when a job profile was written. Prompt includes toolchain notes, VERIFICATION commands, and already-failing baseline rows.
-7. On agent **success**: re-run `verify_commands` into the handoff (`job.verification`, `verify.json`), measure diff hygiene vs the recorded heads (`job.diffHygiene`; advisory only), `judgeVerification` (only `regression` and `blocked` stop a resolve), then harvest. On **failure**: harvest with no verification (partial evidence, no resolve-gate). On **cancel**: existing stop path.
-8. Harvest `fix-evidence/` + `fix-notes/` (regular files under the handoff only). Evidence may import even when the verdict is not ok; resolve and notes-only are skipped unless the verdict is ok or verification did not run. Then `SyncBatchAndDefects`: `complete` leaves harvested defects; `failed`/`cancelled` reopens `in_progress` rows with no `fix_evidence`.
+6. `exec` the coding-agent bin (`GROK_BUILD_BIN` → `DEFECT_DRAINER_GROK_BIN` → `SKETCH_FORGE_GROK_BIN` → Homebrew/`PATH` `grok`) with `--sandbox` from the app `grok_sandbox` (`workspace` or `strict`), or `dd-simulator` when a job profile was written. `--max-turns` comes from the app's `agent_max_turns`, else `DEFECT_DRAINER_GROK_BATCH_MAX_TURNS` / `GROK_BATCH_MAX_TURNS`, else `80`; the stored value is clamped to 1..1000 so a settings typo cannot buy an unbounded run. Output format is `streaming-json`, so DD reads the `end` event (`stopReason`, `num_turns`, `total_cost_usd`, `sessionId`) instead of inferring from exit status. Prompt includes toolchain notes, VERIFICATION commands, and already-failing baseline rows. Iterations 2+ re-exec with `-c` and a code-constant continue prompt.
+7. The driver loop repeats step 6 until `artifactsComplete` (`NOTES.md`, plus `fix-notes/<id>.md` and a harvestable `fix-evidence/<id>/` image per defect, or an exact `UNFIXED:` / `NO-SCREENSHOT:` line) or a cap ends it; `job.agentRun` records iterations, `stoppedBy`, turns and cost after **each** iteration. Then on **no genuine failure**: re-run `verify_commands` into the handoff (`job.verification`, `verify.json`), measure diff hygiene vs the recorded heads (`job.diffHygiene`; advisory only), `judgeVerification` (only `regression` and `blocked` stop a resolve), then harvest with resolve permitted. On **failure** (non-zero exit that is not turn exhaustion): harvest with no verification and `AllowResolve` false — evidence and notes are imported, nothing resolves. On **cancel**: existing stop path.
+8. Harvest `fix-evidence/` + `fix-notes/` (regular files under the handoff only). Evidence may import even when the verdict is not ok; resolve additionally requires an image imported by **this run** (historical `fix_evidence` on the defect is not proof this job fixed anything) and a run permitted to resolve. Then `SyncBatchAndDefects`: `complete` leaves harvested defects; `failed`/`cancelled` reopens `in_progress` rows with no `fix_evidence`.
 9. `POST /api/batch-jobs/{id}/create-prs` and `refresh-prs` run host `gh` (`GH_BIN` overrides) and write `job.prs[]` (`status`, `url`, `ghNumber`, `ghState`, `mergedAt`, `checkedAt`, `branch`, `error`). Skip when there are no commits vs the resolved base (never `origin/origin/main`).
 10. `GET /api/batch-jobs/{id}/diff/{repo}` returns hunks for the console drill-down (`kind=reflow|all`). 404 unknown job / no worktree; 409 no recorded `baseSha`; 410 worktree gone.
 
-`GET /api/batches` returns `{ batches, jobs }`. Job JSON writes `jobId` (still reads legacy `id`) and first-class `verification` / `baseline` / `diffHygiene` (unknown keys still round-trip via Extra).
+`GET /api/batches` returns `{ batches, jobs }`. Job JSON writes `jobId` (still reads legacy `id`) and first-class `verification` / `baseline` / `diffHygiene` / `agentRun` (unknown keys still round-trip via Extra).
 
 The spawned child carries `SKILL_FORGE_AGENT_ROLE=worker`; `serve` itself never sets it, so a human session started from the same shell is not marked as a worker.
+
+Exhausting `--max-turns` ends one **iteration**, not the job. PR-H2's driver loop landed
+alongside this setting: the agent exits 1 with `max turns reached`, and because that is turn
+exhaustion rather than a genuine failure DD resumes the session (`grok -c`) instead of
+failing the job — up to `DEFECT_DRAINER_AGENT_MAX_ITERS` (8) and
+`DEFECT_DRAINER_AGENT_MAX_WALL_SEC` (2700). Branching on the `max_turns_reached` event
+rather than the exit code is what separates the two, since both exit non-zero.
+
+So `agent_max_turns` bounds how much each iteration attempts, and the loop caps bound the
+job. Raise it for repos whose tool calls are slow — a Flutter `pub get` / `analyze` / `test`
+cycle burns turns far faster than a Node one — to spend fewer iterations on the same work.
+
+What has not changed: exhausting the *loop* caps is not a partial success. A defect with no
+new fix evidence from this run stays open, work the agent left uncommitted reaches nothing
+(`gh` skips a PR with no commits ahead of base, and harvest will not resolve), and the job
+records `agentRun.completedByArtifacts: false` so the shortfall is visible rather than
+inferred.
 
 The verification runner is **not sandboxed**. Commands come only from App Settings (`verify_commands`), never from the agent. Their PATH is the host pin (`$FVM_HOME/versions/<pin>/bin`), not the agent-writable handoff clone.
 
