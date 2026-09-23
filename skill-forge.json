@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 2,
+  "extends": [],
+  "skills": {
+    "dependencies": {
+      "security-baseline": "^0.1.0",
+      "coding-discipline": "^0.3.1",
+      "code-quality": "^0.1.1",
+      "testing-strategy": "^0.1.1",
+      "umbrella-workspace": "^0.9.1",
+      "api-contracts": "^0.1.0",
+      "podman-utilization": "^0.1.0",
+      "grok-build-harness": "^0.4.0",
+      "external-worker-delegation": "^0.8.2",
+      "llm-integration": "^0.1.0",
+      "audit-trail": "^0.1.0",
+      "failure-analysis": "^0.1.0",
+      "defect-drainer-intake": "^0.1.1",
+      "skill-forge-project": "^0.5.1"
+    },
+    "shims": [
+      "claude-code"
+    ]
+  }
+}

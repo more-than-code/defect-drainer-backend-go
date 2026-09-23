@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "registry": {
+    "name": "skill-forge",
+    "version": "1.3.0",
+    "commit": "d4d79f06fed19ac633cde15234814720158e8e03",
+    "lockIntegrity": "sha256-ToYrisGJ0Pq4sfKAcp/HqWB7Z9iMrDcbQ18torsONjs="
+  },
+  "skills": {
+    "api-contracts": {
+      "version": "0.1.0",
+      "integrity": "sha256-49RjFOkIjO4LhrwrHrXWJbjZXGYh/zdk/Gi2Hpo4TqY=",
+      "source": "registry"
+    },
+    "audit-trail": {
+      "version": "0.1.0",
+      "integrity": "sha256-aGZ93cdx9clo/87gWFmFufiF5oEnhC5WNx4+rAbVH+o=",
+      "source": "registry"
+    },
+    "code-quality": {
+      "version": "0.1.1",
+      "integrity": "sha256-URPCJOroQR0mJlQPoOkRpTe0xtF/qps48iLkoTwKAEo=",
+      "source": "registry"
+    },
+    "coding-discipline": {
+      "version": "0.3.1",
+      "integrity": "sha256-jS3r/aYrv7m5msRqm8PkAZqwyuVXNNTrNfMRiK1zMBg=",
+      "source": "registry"
+    },
+    "defect-drainer-intake": {
+      "version": "0.1.1",
+      "integrity": "sha256-QUz5qlr9mXBSUcHi4J5jJCn1wqbKSho4ylyXfhax1Gg=",
+      "source": "registry"
+    },
+    "external-worker-delegation": {
+      "version": "0.8.2",
+      "integrity": "sha256-0wSb+FxOw2DP1QEgfzwI05Lawc+q64n3OR2vEmcCjjA=",
+      "source": "registry"
+    },
+    "failure-analysis": {
+      "version": "0.1.0",
+      "integrity": "sha256-8QY5zvT0Lj9mqhyva/I4RiaA8+EJZdA7RnoESjgmQdQ=",
+      "source": "registry"
+    },
+    "grok-build-harness": {
+      "version": "0.4.0",
+      "integrity": "sha256-WTAOAUU1zTLvcBEGc/Y4rC3e0ZPuIIZdE2+xEHp1rSg=",
+      "source": "registry"
+    },
+    "llm-integration": {
+      "version": "0.1.0",
+      "integrity": "sha256-hke/XWo9kPnBocXeb8Dnfdjp1pI9O1Axs0qM1Mcz1go=",
+      "source": "registry"
+    },
+    "podman-utilization": {
+      "version": "0.1.0",
+      "integrity": "sha256-P43XjXAyNVO+qHLfviWPhapje1lINUjIKdQEUlLxE5M=",
+      "source": "registry"
+    },
+    "security-baseline": {
+      "version": "0.1.0",
+      "integrity": "sha256-6BrEv3S5yb6PakSghKmbONVwHilAxmkNQppRNPTv9tc=",
+      "source": "registry"
+    },
+    "skill-forge-project": {
+      "version": "0.5.1",
+      "integrity": "sha256-AKnzlDmHmlshLGWn/zPwK/bCRV86TFVqPi9MOIjyiQs=",
+      "source": "registry"
+    },
+    "testing-strategy": {
+      "version": "0.1.1",
+      "integrity": "sha256-KsqNmZ/F+oxg+PFicC4Q/6LMl+1FtbkwoX7JCgJ8h4A=",
+      "source": "registry"
+    },
+    "umbrella-workspace": {
+      "version": "0.9.1",
+      "integrity": "sha256-JCeUnrpdbERVlfUXLsZXq5V4P51ufa+Ad1L7podH7QU=",
+      "source": "registry"
+    }
+  }
+}
