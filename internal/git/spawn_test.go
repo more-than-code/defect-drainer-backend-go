@@ -424,3 +424,20 @@ func TestStartCodingAgentSessionFlags(t *testing.T) {
 		t.Fatalf("resume must send ContinuePrompt, got %q", argvFlagValue(joined, "-p"))
 	}
 }
+
+// A job profile denies cwd/.grok, so the prompt's write line must say so;
+// without one, cwd is writable whole and the line stays as it was.
+func TestPromptWriteLineNamesLockedJobProfile(t *testing.T) {
+	handoff := "/data/batch-jobs/bjob_x"
+	wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: "/w", PrimaryAbs: "/p", Branch: "b"}}
+	for _, sandbox := range []string{"workspace", "strict"} {
+		with := buildBatchFixCLIPrompt(handoff, "BATCH-1", "/inv", sandbox, wts, &CodingAgentOpts{SandboxProfile: "dd-simulator"})
+		if !strings.Contains(with, "- Write: cwd ("+handoff+") except its .grok/") {
+			t.Fatalf("%s + job profile: write line must carve out .grok:\n%s", sandbox, with)
+		}
+		without := buildBatchFixCLIPrompt(handoff, "BATCH-1", "/inv", sandbox, wts, nil)
+		if strings.Contains(without, "except its .grok/") || !strings.Contains(without, "- Write: cwd ("+handoff+"), ~/.grok/") {
+			t.Fatalf("%s without a job profile: write line changed:\n%s", sandbox, without)
+		}
+	}
+}

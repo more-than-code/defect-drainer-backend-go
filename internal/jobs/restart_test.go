@@ -90,6 +90,7 @@ func artifactsBody(defID string) string {
 func newRestartFixture(t *testing.T, status, stoppedBy, grokBody string, withSession bool) *restartFixture {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GROK_HOME", "")
 	st, data, defects := testStore(t)
 	f := &restartFixture{
 		br: NewBatchRunner(st, data), st: st, defects: defects,

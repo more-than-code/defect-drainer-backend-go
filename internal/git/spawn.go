@@ -358,12 +358,18 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 			wtLines = append(wtLines, "- "+w.Repo+": EDIT ONLY "+w.WorktreeAbs+" (branch "+w.Branch+"); NEVER "+w.PrimaryAbs)
 		}
 	}
+	// A job profile denies its own cwd/.grok (it holds the profile), so cwd is
+	// writable except there.
+	cwdWrite := "cwd (" + handoffAbs + ")"
+	if opts != nil && opts.SandboxProfile != "" {
+		cwdWrite = "cwd (" + handoffAbs + ") except its .grok/ (the locked job sandbox profile — no read or write)"
+	}
 	var sandboxNotes []string
 	if sandbox == "workspace" {
 		sandboxNotes = []string{
 			"SANDBOX: --sandbox workspace (App Settings).",
 			"- Read: host filesystem (iOS Simulator, Xcode, simctl data allowed).",
-			"- Write: cwd (" + handoffAbs + "), ~/.grok/, and temp only.",
+			"- Write: " + cwdWrite + ", ~/.grok/, and temp only.",
 			"- Product code: edit only under cwd/worktrees/…",
 			"- Visual check / fix screenshots: capture under cwd/fix-evidence/<DEF-id>/fix-01.png (handoff-writable).",
 			"- Inventory root " + defectsRoot + " is readable — open report + **historical fix evidence** paths listed in BRIEF.md.",
@@ -372,7 +378,7 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 		sandboxNotes = []string{
 			"SANDBOX: --sandbox strict / restrict (App Settings).",
 			"- Read: cwd + system paths only (no ~/Library Simulator data).",
-			"- Write: cwd (" + handoffAbs + "), ~/.grok/, and temp.",
+			"- Write: " + cwdWrite + ", ~/.grok/, and temp.",
 			"- Product code: edit only under cwd/worktrees/…",
 			"- Historical fix evidence may be unreadable under strict if paths are outside cwd — prefer workspace sandbox for visual history.",
 			"- Inventory updates under " + defectsRoot + " may be blocked; write new proof to handoff fix-evidence/.",

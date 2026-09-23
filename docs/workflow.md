@@ -101,9 +101,15 @@ produce real evidence:
 - **Allow Simulator writes** — writes a job-scoped `.grok/sandbox.toml`
   granting write access to the CoreSimulator device tree, so `simctl install`
   and real screenshots work. One directory, one job; the global profile is
-  untouched.
+  untouched. The handoff is the agent's own writable cwd and grok re-reads a
+  profile on every start, so the profile also denies its own `.grok` dir, and
+  DD re-checks the file before every iteration (Resume's first included).
 
-Both fail soft: a warning and the previous behaviour, never a failed job.
+Both fail soft: a warning and the previous behaviour, never a failed job. The
+one exception is a job profile that no longer holds what DD wrote, or a
+`dd-simulator` defined in the user-level `sandbox.toml` (which would replace
+it): the next iteration is refused and the job fails, because an agent that
+widened its own sandbox must not have its work resolved.
 
 ---
 

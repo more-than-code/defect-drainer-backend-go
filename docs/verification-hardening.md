@@ -30,7 +30,7 @@ The **Where** column names the Go control plane, which is the only implementatio
 | 2 | Baseline run before the agent, so pre-existing red is attributable | `internal/jobs/verify.go` (`judgeVerification`), `internal/jobs/jobs.go` |
 | 3 | Acceptance criteria from the defect body rendered in BRIEF.md | `internal/jobs/brief.go` (`AcceptanceCriteria`) |
 | 4 | Agent toolchain: pinned SDK cloned into the handoff | `internal/jobs/toolchain.go` |
-| 5 | Job-scoped Simulator write grant | `internal/jobs/sandbox.go` |
+| 5 | Job-scoped Simulator write grant; denies its own `.grok` and is byte-checked before every iteration | `internal/jobs/sandbox.go` |
 | 6 | BRIEF names each worktree's own contract files (AGENTS.md / CLAUDE.md) | `internal/jobs/brief.go` (`contractFilesIn`) |
 | 7 | Diff-hygiene measurement: how much of the diff is reformatting | `internal/jobs/diff_hygiene.go` |
 | 8 | Worker role: BRIEF declares it, `PROCESS.md` is the contract, `SKILLS.md` lists per-worktree skill paths, `SKILL_FORGE_AGENT_ROLE=worker` on the child (PR-H1, Go only) | `jobs/worker_files.go`, `jobs/brief.go`, `git/spawn.go` |

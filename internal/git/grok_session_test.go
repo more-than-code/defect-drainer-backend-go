@@ -31,6 +31,7 @@ func writeGrokSession(t *testing.T, cwd, id string, mtime time.Time) {
 // The directory name was read off disk for a real job on 2026-09-23.
 func TestGrokSessionsDirMatchesGrokEscaping(t *testing.T) {
 	t.Setenv("HOME", "/home/op")
+	t.Setenv("GROK_HOME", "")
 	got, err := GrokSessionsDir("/Users/joe/workspace/defect-drainer/backend-go/.data/batch-jobs/bjob_muck130x_a5ad08c9")
 	if err != nil {
 		t.Fatal(err)
@@ -41,8 +42,22 @@ func TestGrokSessionsDirMatchesGrokEscaping(t *testing.T) {
 	}
 }
 
+// GROK_HOME moves grok's session store; Resume must look where grok writes.
+func TestGrokSessionsDirFollowsGrokHome(t *testing.T) {
+	t.Setenv("HOME", "/home/op")
+	t.Setenv("GROK_HOME", "/srv/grok")
+	got, err := GrokSessionsDir("/work/job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/srv/grok/sessions/%2Fwork%2Fjob"; got != want {
+		t.Fatalf("got %s, want %s", got, want)
+	}
+}
+
 func TestLatestGrokSessionPicksNewestWithHistory(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GROK_HOME", "")
 	cwd := t.TempDir()
 	older := "01a0c8be-7e0e-7c71-92ad-cd85bf99e86f"
 	newer := "01a0c8be-7e0e-7c71-92ad-cd85bf99e870"
@@ -70,6 +85,7 @@ func TestLatestGrokSessionPicksNewestWithHistory(t *testing.T) {
 
 func TestLatestGrokSessionNoneFound(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GROK_HOME", "")
 	if id, ok := LatestGrokSession(t.TempDir()); ok || id != "" {
 		t.Fatalf("missing sessions root must be not-found, got %q", id)
 	}

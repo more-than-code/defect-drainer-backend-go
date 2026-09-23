@@ -1523,7 +1523,13 @@ func formatGrokExit(err error) string {
 	if err == nil {
 		return fmt.Sprintf("Grok exited code=%s signal=%s", code, sig)
 	}
-	if ee, ok := err.(*exec.ExitError); ok && ee.ProcessState != nil {
+	ee, ok := err.(*exec.ExitError)
+	if !ok {
+		// A child that never started has no exit status; its reason is the
+		// only useful thing to show (e.g. a refused sandbox profile).
+		return err.Error()
+	}
+	if ee.ProcessState != nil {
 		code = strconv.Itoa(ee.ExitCode())
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 			sig = unixSignalName(ws.Signal())
@@ -1683,6 +1689,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	}
 
 	var sandboxProfile string
+	var profileBody []byte
 	var profileNotes []string
 	if simWrites {
 		profile, err := writeSimulatorSandboxProfile(handoff, sandbox, batchID)
@@ -1690,6 +1697,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 			spawnLog("sandbox: job profile failed — skipped ("+err.Error()+")", "warn")
 		} else {
 			sandboxProfile = profile.Profile
+			profileBody = profile.Body
 			profileNotes = profile.Notes
 			spawnLog("sandbox: job profile '"+profile.Profile+"' extends "+sandbox+" + Simulator device writes", "info")
 		}
@@ -1763,6 +1771,13 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	// Every iteration uses identical argv except for -c + the continue prompt,
 	// so the sandbox and turn budget cannot drift between them.
 	startIter := func(resume bool, session string) (*exec.Cmd, func(), error) {
+		// The previous iteration ran with this handoff as its writable cwd,
+		// and grok re-reads the profile on every start.
+		if sandboxProfile != "" {
+			if err := checkSimulatorSandboxProfile(handoff, profileBody); err != nil {
+				return nil, nil, err
+			}
+		}
 		return git.StartCodingAgent(handoff, batchID, defectsRoot, wts, sandbox, onStdout, onStderr, &git.CodingAgentOpts{
 			ExtraEnv:       provisioned.Env,
 			SandboxProfile: sandboxProfile,

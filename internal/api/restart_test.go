@@ -55,6 +55,7 @@ type restartJobJSON struct {
 // 200 / 409 live / 400 with the rule's reason / 404.
 func TestRestartRoutes(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GROK_HOME", "")
 	data, defects := t.TempDir(), t.TempDir()
 	seedStoppedJob(t, data, "bjob_api", "grok", "failed")
 	seedStoppedJob(t, data, "bjob_manual", "manual", "manual")

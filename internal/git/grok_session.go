@@ -14,11 +14,10 @@ import (
 var grokSessionID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // GrokSessionsDir is where Grok Build keeps the sessions for one cwd:
-// ~/.grok/sessions/<url-escaped absolute cwd>/<uuid>/ (verified on 1.0.40).
-// The child inherits this process's HOME — the Flutter shims redirect HOME
-// only for the SDK — so the server's home is the agent's home.
+// <GrokHome>/sessions/<url-escaped absolute cwd>/<uuid>/ (verified on 1.0.40).
+// GrokHome honours $GROK_HOME, which redirects the sessions store too.
 func GrokSessionsDir(cwd string) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := GrokHome()
 	if err != nil {
 		return "", err
 	}
@@ -26,7 +25,7 @@ func GrokSessionsDir(cwd string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".grok", "sessions", url.PathEscape(abs)), nil
+	return filepath.Join(home, "sessions", url.PathEscape(abs)), nil
 }
 
 // LatestGrokSession returns the newest session for cwd that has a chat
