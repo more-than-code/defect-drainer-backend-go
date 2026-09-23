@@ -362,3 +362,65 @@ func TestStartCodingAgentMaxTurnsPrecedence(t *testing.T) {
 		}
 	})
 }
+
+// -r <id> continues that exact session; -c continues the cwd's latest. Both
+// send ContinuePrompt, never the full brief, and -r wins when both are set.
+func TestStartCodingAgentSessionFlags(t *testing.T) {
+	argv := func(t *testing.T, opts *CodingAgentOpts) []string {
+		t.Helper()
+		out := filepath.Join(t.TempDir(), "args.txt")
+		bin := filepath.Join(t.TempDir(), "fake-grok")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + out + "\"\nexit 0\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GROK_BUILD_BIN", bin)
+		wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
+		cmd, flush, err := StartCodingAgent(t.TempDir(), "BATCH-session", t.TempDir(), wts, "strict", nil, nil, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if flush != nil {
+			flush()
+		}
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Split(string(got), "\n")
+	}
+	has := func(args []string, flag string) bool {
+		for _, a := range args {
+			if a == flag {
+				return true
+			}
+		}
+		return false
+	}
+	const id = "01a0c8be-7e0e-7c71-92ad-cd85bf99e86f"
+
+	fresh := argv(t, nil)
+	if has(fresh, "-c") || has(fresh, "-r") {
+		t.Fatalf("a fresh spawn must not continue a session: %q", fresh)
+	}
+	if strings.HasPrefix(argvFlagValue(strings.Join(fresh, "\n"), "-p"), "Continue executing BRIEF.md") {
+		t.Fatal("a fresh spawn must send the brief prompt")
+	}
+
+	cont := argv(t, &CodingAgentOpts{Continue: true})
+	if !has(cont, "-c") || has(cont, "-r") {
+		t.Fatalf("Continue wants -c only: %q", cont)
+	}
+
+	res := argv(t, &CodingAgentOpts{Continue: true, ResumeSession: id})
+	joined := strings.Join(res, "\n")
+	if argvFlagValue(joined, "-r") != id || has(res, "-c") {
+		t.Fatalf("ResumeSession wants -r %s and no -c: %q", id, res)
+	}
+	if !strings.HasPrefix(argvFlagValue(joined, "-p"), "Continue executing BRIEF.md") {
+		t.Fatalf("resume must send ContinuePrompt, got %q", argvFlagValue(joined, "-p"))
+	}
+}

@@ -132,6 +132,7 @@ func (a *App) mux() http.Handler {
 	m.HandleFunc("DELETE /api/batch-jobs/{id}", a.deleteBatchJob)
 	m.HandleFunc("POST /api/batch-jobs/{id}/stop", a.stopBatchJob)
 	m.HandleFunc("POST /api/batch-jobs/{id}/rerun", a.rerunBatchJob)
+	m.HandleFunc("POST /api/batch-jobs/{id}/resume", a.resumeBatchJob)
 	m.HandleFunc("POST /api/batch-jobs/{id}/create-prs", a.createPRs)
 	m.HandleFunc("POST /api/batch-jobs/{id}/refresh-prs", a.refreshPRs)
 	m.HandleFunc("POST /api/git/branches", a.gitBranches)

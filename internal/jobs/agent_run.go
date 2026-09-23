@@ -21,6 +21,9 @@ type AgentRun struct {
 	TotalCostUSD         float64  `json:"totalCostUsd,omitempty"`
 	SessionID            string   `json:"sessionId,omitempty"`
 	Missing              []string `json:"missing,omitempty"`
+	// Resumes counts operator Resumes. Iterations, turns and cost above are
+	// cumulative across every run of the job, not just the latest.
+	Resumes int `json:"resumes,omitempty"`
 }
 
 // Reasons the loop stopped. Only StoppedByArtifacts means the worker delivered
@@ -190,6 +193,20 @@ type agentRunAcc struct {
 	costUSD     float64
 	sessionID   string
 	maxTurns    bool
+}
+
+// seed carries a prior run's totals into this one, so a Re-run or Resume adds
+// to the job's record instead of replacing it.
+func (a *agentRunAcc) seed(prior *AgentRun) {
+	if prior == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopReasons = append([]string(nil), prior.StopReasons...)
+	a.turns = prior.Turns
+	a.costUSD = prior.TotalCostUSD
+	a.sessionID = prior.SessionID
 }
 
 func (a *agentRunAcc) end(stopReason, sessionID string, turns int, cost float64) {

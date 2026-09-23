@@ -527,7 +527,7 @@ func (a *App) getBatches(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list, "jobs": a.Batches.List()})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list, "jobs": a.Batches.ListView()})
 }
 
 func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
@@ -615,7 +615,7 @@ func (a *App) getBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) getBatchJob(w http.ResponseWriter, r *http.Request) {
-	j := a.Batches.GetJob(r.PathValue("id"))
+	j := a.Batches.GetJobView(r.PathValue("id"))
 	if j == nil {
 		httpx.WriteError(w, http.StatusNotFound, "not found")
 		return
@@ -719,16 +719,34 @@ func (a *App) stopBatchJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) rerunBatchJob(w http.ResponseWriter, r *http.Request) {
-	j := a.Batches.GetJob(r.PathValue("id"))
-	if j == nil {
-		httpx.WriteError(w, http.StatusNotFound, "not found")
+	a.restartBatchJob(w, r, false)
+}
+
+func (a *App) resumeBatchJob(w http.ResponseWriter, r *http.Request) {
+	a.restartBatchJob(w, r, true)
+}
+
+// restartBatchJob: 409 while an agent is live, 400 with the rule's reason when
+// the job cannot restart, 404 for an unknown id.
+func (a *App) restartBatchJob(w http.ResponseWriter, r *http.Request, resume bool) {
+	id := r.PathValue("id")
+	if !store.IsSafeJobID(id) {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := a.Batches.StartSpawn(j.ID, a.Roots.DefectsRoot); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+	j, err := a.Batches.Restart(id, a.Roots.DefectsRoot, resume)
+	if err != nil {
+		code := http.StatusBadRequest
+		switch {
+		case errors.Is(err, jobs.ErrJobLive):
+			code = http.StatusConflict
+		case strings.Contains(err.Error(), "not found"):
+			code = http.StatusNotFound
+		}
+		httpx.WriteError(w, code, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": a.Batches.GetJob(j.ID)})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j})
 }
 
 func (a *App) createPRs(w http.ResponseWriter, r *http.Request) {

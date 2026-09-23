@@ -115,7 +115,7 @@ Both fail soft: a warning and the previous behaviour, never a failed job.
 | **Permissions / sandbox** | OS-level sandbox profiles (`strict` / `workspace`) per app |
 | **Brief / handoff** | `BRIEF.md` (role, facts, decisions, deliverables, defects) + `PROCESS.md` (worker contract) + `SKILLS.md` (per-worktree skill and contract paths) under the job handoff dir |
 | **Observability** | Job log stream (harness lines vs agent lines) |
-| **Stop / re-run** | Console job actions |
+| **Stop / resume / re-run** | Console job actions; the server decides which restarts a job allows and says why not |
 | **Deterministic ops** | Create PR, refresh merge state, resolve — host tools, not “hope the model did it” |
 
 The **coding agent is a worker inside the harness**, not the product. The harness owns inventory, gates (fix-backed-by-evidence), and git/PR actions.
@@ -152,6 +152,20 @@ top: a defect resolves only with an image imported **by this run** — prose plu
 screenshot from a previous job no longer counts — and only when verification
 shows no regression. A failed or cancelled run harvests its evidence and notes so
 nothing is lost, and resolves nothing.
+
+When the loop has stopped, the operator can restart the same job two ways, both on
+the same worktrees and handoff. **Resume** continues the agent's last session
+(`grok -r <session>`), so its reasoning survives a Stop, a backend restart, a
+crash, or a run that hit the iteration or wall cap with artifacts still missing.
+**Re-run** starts a new session for when the agent went down the wrong path. Both
+reuse the first run's baseline — the worktree now holds the agent's edits, so
+re-measuring would compare the agent with itself. Files the session already
+wrote still count toward "done", but a defect resolves only on a screenshot
+created after the restart; earlier images are never imported twice. Both add to
+`agentRun` instead of replacing it, each with a fresh iteration and wall budget.
+Neither is allowed while an agent is live, once a PR has merged or closed, or when
+a worktree is gone; Resume also needs the session on disk and a run that stopped
+short of its artifacts.
 
 ---
 

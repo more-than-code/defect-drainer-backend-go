@@ -219,6 +219,10 @@ type CodingAgentOpts struct {
 	// Continue resumes the most recent session for this cwd (-c) with
 	// ContinuePrompt instead of sending the full brief prompt again.
 	Continue bool
+	// ResumeSession resumes that exact session (-r <id>) with ContinuePrompt.
+	// An operator Resume uses it so the log names the session continued.
+	// Wins over Continue.
+	ResumeSession string
 	// OnEnd receives the `end` event; OnMaxTurns fires on the separate
 	// max_turns_reached event, which is how turn exhaustion is told apart from
 	// a genuine failure (both exit non-zero).
@@ -500,7 +504,10 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	// turn budget cannot drift between iterations.
 	args := []string{}
 	promptArg := prompt
-	if opts != nil && opts.Continue {
+	if opts != nil && opts.ResumeSession != "" {
+		promptArg = ContinuePrompt
+		args = append(args, "-r", opts.ResumeSession)
+	} else if opts != nil && opts.Continue {
 		promptArg = ContinuePrompt
 		args = append(args, "-c")
 	}

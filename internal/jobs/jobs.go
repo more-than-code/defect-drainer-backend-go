@@ -49,12 +49,16 @@ type Job struct {
 	Baseline     *VerificationRun      `json:"baseline,omitempty"`
 	DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
 	AgentRun     *AgentRun             `json:"agentRun,omitempty"`
+	DiffBase     map[string]string     `json:"diffBase,omitempty"`     // worktree HEADs at first spawn; restarts measure hygiene from here
+	RunStartedAt string                `json:"runStartedAt,omitempty"` // latest Re-run/Resume; harvest imports only images newer than this
 	Log          []string              `json:"log,omitempty"`
 	Source       string                `json:"source,omitempty"`
 	DefectPath   string                `json:"defectPath,omitempty"`
 	Severity     string                `json:"severity,omitempty"`
 	Client       string                `json:"client,omitempty"`
 	Surface      string                `json:"surface,omitempty"`
+	Resumable    *RestartCheck         `json:"resumable,omitempty"`  // computed on API reads (GetJobView/ListView), never persisted
+	Rerunnable   *RestartCheck         `json:"rerunnable,omitempty"` // computed on API reads (GetJobView/ListView), never persisted
 	Extra        map[string]any        `json:"-"`
 }
 
@@ -66,8 +70,8 @@ var jobOwnedJSON = map[string]bool{
 	"error": true, "handoffPath": true, "createdAt": true, "updatedAt": true,
 	"comment": true, "reporter": true, "prs": true, "worktrees": true,
 	"verification": true, "baseline": true, "diffHygiene": true,
-	"agentRun": true,
-	"log":      true, "source": true, "defectPath": true,
+	"agentRun": true, "diffBase": true, "runStartedAt": true, "resumable": true, "rerunnable": true,
+	"log": true, "source": true, "defectPath": true,
 	"severity": true, "client": true, "surface": true,
 }
 
@@ -141,12 +145,16 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		Baseline     *VerificationRun      `json:"baseline,omitempty"`
 		DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
 		AgentRun     *AgentRun             `json:"agentRun,omitempty"`
+		DiffBase     map[string]string     `json:"diffBase,omitempty"`
+		RunStartedAt string                `json:"runStartedAt,omitempty"`
 		Log          []string              `json:"log,omitempty"`
 		Source       string                `json:"source,omitempty"`
 		DefectPath   string                `json:"defectPath,omitempty"`
 		Severity     string                `json:"severity,omitempty"`
 		Client       string                `json:"client,omitempty"`
 		Surface      string                `json:"surface,omitempty"`
+		Resumable    *RestartCheck         `json:"resumable,omitempty"`
+		Rerunnable   *RestartCheck         `json:"rerunnable,omitempty"`
 	}
 	b, err := json.Marshal(wire{
 		ID: j.ID, Kind: j.Kind, Status: j.Status, Mode: j.Mode, AppID: j.AppID,
@@ -155,8 +163,9 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt, Comment: j.Comment,
 		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees,
 		Verification: j.Verification, Baseline: j.Baseline, DiffHygiene: j.DiffHygiene,
-		AgentRun: j.AgentRun,
-		Log:      j.Log, Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
+		AgentRun: j.AgentRun, DiffBase: j.DiffBase, RunStartedAt: j.RunStartedAt,
+		Resumable: j.Resumable, Rerunnable: j.Rerunnable,
+		Log: j.Log, Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
 		Client: j.Client, Surface: j.Surface,
 	})
 	if err != nil {
@@ -386,6 +395,12 @@ func cloneJob(j *Job) *Job {
 			a.Missing = append([]string(nil), j.AgentRun.Missing...)
 		}
 		c.AgentRun = &a
+	}
+	if j.DiffBase != nil {
+		c.DiffBase = make(map[string]string, len(j.DiffBase))
+		for k, v := range j.DiffBase {
+			c.DiffBase[k] = v
+		}
 	}
 	if j.DiffHygiene != nil {
 		d := *j.DiffHygiene
@@ -729,7 +744,12 @@ type BatchRunner struct {
 	// first Start. Between reaping one iteration and starting the next,
 	// procs[jobID] is empty, so Stop's signal is a no-op and DeleteJob would
 	// otherwise RemoveAll the handoff out from under the next child.
-	looping      map[string]chan struct{}
+	looping map[string]chan struct{}
+	// driving spans the whole driver goroutine, verify and harvest included.
+	// Stop can cancel a job mid-harvest; until this clears, a Restart would
+	// share the handoff with a goroutine that still writes the job and, on
+	// exit, cancels whatever verify context is current.
+	driving      map[string]bool
 	verifyCancel map[string]context.CancelFunc
 	store        *store.Store
 	dataRoot     string
@@ -1149,6 +1169,19 @@ func harvestCutoff(j *Job) time.Time {
 	return t
 }
 
+// importCutoff is the stricter cutoff for importing fix images: the start of
+// the latest restart, else the job's creation. The driver loop keeps
+// harvestCutoff so artifacts a resumed session already wrote still count
+// toward completion; only the import, and so resolve, is per run.
+func importCutoff(j *Job) time.Time {
+	if j != nil && j.RunStartedAt != "" {
+		if t, err := time.Parse(time.RFC3339Nano, j.RunStartedAt); err == nil {
+			return t
+		}
+	}
+	return harvestCutoff(j)
+}
+
 // readRegularFile reads p only when p is a regular file reached without
 // traversing a symlink. The agent that populates the handoff directory is
 // sandboxed precisely so it cannot read host secrets; harvest is not. Following
@@ -1272,6 +1305,7 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 	imported := 0
 	resolved := 0
 	cutoff := harvestCutoff(job)
+	imgCutoff := importCutoff(job)
 
 	for _, defectID := range job.DefectIDs {
 		if !store.IsSafeID(defectID) {
@@ -1292,7 +1326,7 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 				if !harvestableImageName(name, e.IsDir()) {
 					continue
 				}
-				data, tooLarge, ok := readRegularFile(handoff, filepath.Join(imgDir, name), cutoff)
+				data, tooLarge, ok := readRegularFile(handoff, filepath.Join(imgDir, name), imgCutoff)
 				if tooLarge {
 					b.appendLog(job, fmt.Sprintf("harvest %s: skip %s (exceeds %d bytes)", defectID, name, harvestFileLimit), "warn", "DefectDrainer")
 					continue
@@ -1554,6 +1588,15 @@ func abandonStartedAgent(cmd *exec.Cmd, flush func()) {
 // is still nil; this function honours it after the brief write and after Start
 // and will not install the handle or overwrite the status.
 func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
+	return b.startSpawn(jobID, defectsRoot, spawnFresh, "")
+}
+
+// startSpawn is StartSpawn with a mode. A fresh spawn measures baseline and
+// diff base; rerun and resume reuse the first run's — the worktree now holds
+// the agent's edits, so re-measuring would compare the agent against itself —
+// and add to the stored agentRun. resumeSession, when set, is the grok
+// session iteration 1 continues (-r).
+func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resumeSession string) error {
 	b.mu.Lock()
 	j := b.jobs[jobID]
 	if j == nil {
@@ -1654,12 +1697,23 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 
 	diffBaseByRepo := map[string]string{}
 	for _, w := range wts {
-		diffBaseByRepo[w.Repo] = worktreeHead(w.WorktreeAbs)
+		if sha := jobCopy.DiffBase[w.Repo]; sha != "" {
+			diffBaseByRepo[w.Repo] = sha
+		} else {
+			diffBaseByRepo[w.Repo] = worktreeHead(w.WorktreeAbs)
+		}
 	}
 	realByRepo := snapshotWorktreeReals(wts)
 
 	var baseline *VerificationRun
-	if len(verifyCommands) > 0 {
+	if mode != spawnFresh {
+		baseline = jobCopy.Baseline
+		if baseline != nil {
+			spawnLog("baseline: reusing the first run's (measured before any agent edits)", "info")
+		} else if len(verifyCommands) > 0 {
+			spawnLog("baseline: none stored — skipped; verify judges without one, so every red command blocks", "warn")
+		}
+	} else if len(verifyCommands) > 0 {
 		run := runVerification(ctx, verifyCommands, wts, filepath.Join(handoff, "baseline"), repoEntries, provisioned.VerifyEnv, realByRepo, func(line, level string) {
 			spawnLog("baseline "+line, level)
 		})
@@ -1691,9 +1745,24 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 	}
 	notes := append(append([]string{}, provisioned.Notes...), profileNotes...)
 	acc := &agentRunAcc{}
+	// Re-run and Resume add to the job's record. The caps below still count
+	// this run's iterations only, so every restart gets a fresh budget.
+	priorIters, resumes := 0, 0
+	if mode != spawnFresh && jobCopy.AgentRun != nil {
+		acc.seed(jobCopy.AgentRun)
+		priorIters, resumes = jobCopy.AgentRun.Iterations, jobCopy.AgentRun.Resumes
+	}
+	if mode == spawnResume {
+		resumes++
+	}
+	runRecord := func(iter int, stoppedBy string, missing []string) *AgentRun {
+		run := acc.snapshot(priorIters+iter, stoppedBy, missing)
+		run.Resumes = resumes
+		return run
+	}
 	// Every iteration uses identical argv except for -c + the continue prompt,
 	// so the sandbox and turn budget cannot drift between them.
-	startIter := func(resume bool) (*exec.Cmd, func(), error) {
+	startIter := func(resume bool, session string) (*exec.Cmd, func(), error) {
 		return git.StartCodingAgent(handoff, batchID, defectsRoot, wts, sandbox, onStdout, onStderr, &git.CodingAgentOpts{
 			ExtraEnv:       provisioned.Env,
 			SandboxProfile: sandboxProfile,
@@ -1702,13 +1771,14 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 			AlreadyFailing: alreadyFailingLines(baseline),
 			MaxTurns:       maxTurns,
 			Continue:       resume,
+			ResumeSession:  session,
 			OnEnd: func(e git.AgentEnd) {
 				acc.end(e.StopReason, e.SessionID, e.NumTurns, e.TotalCostUSD)
 			},
 			OnMaxTurns: acc.maxTurnsReached,
 		})
 	}
-	cmd, flush, err := startIter(false)
+	cmd, flush, err := startIter(false, resumeSession)
 	if err != nil {
 		return err
 	}
@@ -1731,6 +1801,9 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 	b.procs[jobID] = proc
 	live.Status = "running"
 	live.Error = ""
+	if live.DiffBase == nil {
+		live.DiffBase = diffBaseByRepo
+	}
 	b.appendLogLocked(live, fmt.Sprintf(
 		"spawning batch fix: %s — %s sandbox=%s cwd=%s (%d worktree(s))",
 		bin, batchID, sandbox, handoff, len(wts),
@@ -1747,6 +1820,10 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 		b.looping = map[string]chan struct{}{}
 	}
 	b.looping[jobID] = loopDone
+	if b.driving == nil {
+		b.driving = map[string]bool{}
+	}
+	b.driving[jobID] = true
 	b.mu.Unlock()
 	go func() {
 		// endLoop releases DeleteJob as soon as no further child can start. It
@@ -1768,10 +1845,15 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 		}
 		defer func() {
 			endLoop()
+			// Cancel before releasing driving: once it clears, a Restart may
+			// install the next run's cancel under the same id.
+			b.callVerifyCancel(jobID)
+			b.mu.Lock()
+			delete(b.driving, jobID)
+			b.mu.Unlock()
 			if spawnExitHook != nil {
 				spawnExitHook()
 			}
-			b.callVerifyCancel(jobID)
 		}()
 
 		// Driver loop: completion is the artifacts BRIEF.md demands, not the
@@ -1805,8 +1887,8 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 			// cost and stop reasons on disk.
 			b.mu.Lock()
 			if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
-				live.AgentRun = acc.snapshot(iter, stoppedBy, missing)
-				b.appendLogLocked(live, loopIterationLine(iter, exitErr, sawMaxTurns, complete, stoppedBy, missing), loopLevel(stoppedBy), "DefectDrainer")
+				live.AgentRun = runRecord(iter, stoppedBy, missing)
+				b.appendLogLocked(live, loopIterationLine(priorIters+iter, exitErr, sawMaxTurns, complete, stoppedBy, missing), loopLevel(stoppedBy), "DefectDrainer")
 			}
 			b.mu.Unlock()
 			b.persistLive(jobID)
@@ -1824,14 +1906,14 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 			if gone {
 				return
 			}
-			nextCmd, nextFlush, nerr := startIter(true)
+			nextCmd, nextFlush, nerr := startIter(true, "")
 			if nerr != nil {
 				exitErr = nerr
 				stoppedBy = StoppedByExit
 				b.mu.Lock()
 				if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
-					live.AgentRun = acc.snapshot(iter, stoppedBy, missing)
-					b.appendLogLocked(live, "agent iteration "+strconv.Itoa(iter)+" failed to start: "+nerr.Error(), "error", "DefectDrainer")
+					live.AgentRun = runRecord(iter, stoppedBy, missing)
+					b.appendLogLocked(live, "agent iteration "+strconv.Itoa(priorIters+iter)+" failed to start: "+nerr.Error(), "error", "DefectDrainer")
 				}
 				b.mu.Unlock()
 				b.persistLive(jobID)
