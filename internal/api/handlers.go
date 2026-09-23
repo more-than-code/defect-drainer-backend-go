@@ -555,14 +555,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 	if spawn {
 		a.Batches.FlipInProgress(job.DefectIDs)
 		appRec, _ := store.GetApp(a.DB, rec.AppID)
-		primaries := map[string]string{}
-		if appRec != nil {
-			for _, e := range appRec.RepoEntries {
-				if e.URL != "" && (e.BaseSource == "local" || strings.HasPrefix(e.URL, "/")) {
-					primaries[e.Name] = e.URL
-				}
-			}
-		}
+		primaries := worktreeRequests(appRec)
 		if len(primaries) == 0 {
 			msg := "no product repos resolved for worktrees — set defect.repos and/or app.repos + workspace_root"
 			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
@@ -603,6 +596,38 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"batch": rec, "job": job})
+}
+
+// worktreeRequests is the local checkout plus the base that Settings saved.
+// A repo entry with an empty branch uses the app-level base_branch, then main.
+// GitHub URLs that are not a local path are not checkouts and stay out.
+func worktreeRequests(app *store.AppRecord) map[string]gitpkg.WorktreeRequest {
+	if app == nil {
+		return nil
+	}
+	remote := store.ParseGitRefName(app.BaseRemote, "origin")
+	fallback := store.ParseGitRefName(app.BaseBranch, "main")
+	out := map[string]gitpkg.WorktreeRequest{}
+	for _, e := range app.RepoEntries {
+		if e.URL == "" || (e.BaseSource != "local" && !strings.HasPrefix(e.URL, "/")) {
+			continue
+		}
+		branch := e.BaseBranch
+		if branch == "" {
+			branch = fallback
+		}
+		source := e.BaseSource
+		if source != "local" {
+			source = "origin"
+		}
+		out[e.Name] = gitpkg.WorktreeRequest{
+			PrimaryAbs: e.URL,
+			Source:     source,
+			Remote:     remote,
+			Branch:     branch,
+		}
+	}
+	return out
 }
 
 func (a *App) getBatch(w http.ResponseWriter, r *http.Request) {
@@ -749,8 +774,36 @@ func (a *App) restartBatchJob(w http.ResponseWriter, r *http.Request, resume boo
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j})
 }
 
+func (a *App) shipPreview(w http.ResponseWriter, r *http.Request) {
+	preview, err := a.Batches.ShipPreview(r.PathValue("id"))
+	if err != nil {
+		code := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			code = http.StatusNotFound
+		}
+		httpx.WriteError(w, code, err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, preview)
+}
+
 func (a *App) createPRs(w http.ResponseWriter, r *http.Request) {
-	j, err := a.Batches.CreatePRs(r.PathValue("id"))
+	var body struct {
+		Commit  bool   `json:"commit"`
+		Message string `json:"message"`
+	}
+	if err := httpx.DecodeJSON(r, jsonBodyLimit, &body); err != nil && !errors.Is(err, io.EOF) {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	body.Message = strings.TrimSpace(body.Message)
+	if len(body.Message) > 2000 {
+		httpx.WriteError(w, http.StatusBadRequest, "commit message is too long")
+		return
+	}
+	j, err := a.Batches.CreatePRs(r.PathValue("id"), gitpkg.ShipRequest{
+		Commit: body.Commit, Message: body.Message,
+	})
 	if err != nil {
 		code := http.StatusBadRequest
 		if strings.Contains(err.Error(), "not found") {

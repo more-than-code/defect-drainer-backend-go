@@ -442,7 +442,7 @@ func TestCreatePRsDoesNotHoldMutexAcrossSQL(t *testing.T) {
 
 	created := make(chan struct{})
 	go func() {
-		_, _ = br.CreatePRs(job.ID)
+		_, _ = br.CreatePRs(job.ID, git.ShipRequest{})
 		close(created)
 	}()
 

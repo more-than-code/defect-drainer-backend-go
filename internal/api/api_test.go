@@ -536,6 +536,9 @@ func TestWorkerSpawnAndGhPRRoutes(t *testing.T) {
 	if out, err := cm.CombinedOutput(); err != nil {
 		t.Fatalf("commit AGENTS.md: %s", out)
 	}
+	if out, err := exec.Command("git", "-C", primary, "update-ref", "refs/remotes/origin/main", "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("origin/main: %s", out)
+	}
 
 	mark := filepath.Join(t.TempDir(), "spawned")
 	grok := filepath.Join(t.TempDir(), "fake-grok")
@@ -560,7 +563,7 @@ exit 1
 	patched := doJSON(t, app.Handler, http.MethodPatch, "/api/apps/"+store.SeededTutoredWebappAppID, map[string]any{
 		"grok_sandbox": "workspace",
 		"repo_entries": []map[string]any{
-			{"name": "demo", "url": primary, "base_source": "local", "base_branch": "main"},
+			{"name": "demo", "url": primary, "base_source": "origin", "base_branch": "main"},
 		},
 	})
 	if patched.Code != 200 {
@@ -613,6 +616,9 @@ exit 1
 	}
 	if len(batchOut.Job.Worktrees) == 0 {
 		t.Fatalf("expected worktrees on job: %s", created.Body)
+	}
+	if batchOut.Job.Worktrees[0].BaseSource != "origin" || batchOut.Job.Worktrees[0].BaseBranch != "main" || batchOut.Job.Worktrees[0].BaseRef != "origin/main" {
+		t.Fatalf("worktree base: %+v", batchOut.Job.Worktrees[0])
 	}
 	briefBytes, err := os.ReadFile(filepath.Join(app.Roots.DataRoot, "batch-jobs", batchOut.Job.ID, "BRIEF.md"))
 	if err != nil {

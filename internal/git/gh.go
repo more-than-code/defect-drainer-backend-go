@@ -24,6 +24,8 @@ type PRResult struct {
 	Error     string `json:"error,omitempty"`
 	Commits   int    `json:"commits,omitempty"`
 	GhError   string `json:"ghError,omitempty"`
+	// Kind is "pr" for a GitHub pull request and "merge" for a local-base merge.
+	Kind string `json:"kind,omitempty"`
 }
 
 // GhBin is GH_BIN or "gh" (tests inject a fake at GH_BIN).
@@ -81,20 +83,31 @@ func mapGhState(s string) string {
 }
 
 // CreatePRsForWorktrees pushes (best-effort) and runs `gh pr create` per binding.
-func CreatePRsForWorktrees(bindings []WorktreeBinding, batchID, title string) []PRResult {
+// When ship.Commit is set, each local worktree's uncommitted files are committed
+// onto the job branch before that branch is merged. GitHub bases are unchanged.
+func CreatePRsForWorktrees(bindings []WorktreeBinding, batchID, title string, ship ShipRequest) []PRResult {
 	var out []PRResult
 	for _, b := range bindings {
-		_, branch, _ := ResolveBaseRef(b.PrimaryAbs, "origin", "main")
-		if branch == "" {
-			branch = "main"
+		source, ref, branch := bindingBase(b)
+		if source == "local" {
+			if ship.Commit {
+				if err := commitLocalChanges(b, ship.Message); err != nil {
+					out = append(out, PRResult{
+						Repo: b.Repo, Branch: b.Branch, Base: branch, Kind: "merge",
+						Status: "failed", Error: clipGit(err.Error()),
+					})
+					continue
+				}
+			}
+			out = append(out, mergeIntoLocalBase(b, ref, branch))
+			continue
 		}
-		entry := PRResult{Repo: b.Repo, Branch: b.Branch, Base: branch, Status: "failed"}
+		entry := PRResult{Repo: b.Repo, Branch: b.Branch, Base: branch, Kind: "pr", Status: "failed"}
 		if st, err := os.Stat(b.WorktreeAbs); err != nil || !st.IsDir() || !IsGitRepo(b.WorktreeAbs) {
 			entry.Error = "worktree missing"
 			out = append(out, entry)
 			continue
 		}
-		ref, _, _ := ResolveBaseRef(b.PrimaryAbs, "origin", "main")
 		commits := countCommits(b.WorktreeAbs, ref)
 		if commits == 0 {
 			commits = countCommits(b.WorktreeAbs, branch)
@@ -170,6 +183,11 @@ func RefreshPRStatuses(prs []PRResult, worktrees []WorktreeBinding) []PRResult {
 	for _, prev := range prs {
 		entry := prev
 		entry.URL = AcceptPRURL(entry.URL)
+		if entry.Kind == "merge" || (entry.Status == "merged" && entry.URL == "") {
+			confirmLocalMerge(&entry, worktrees)
+			out = append(out, entry)
+			continue
+		}
 		trackable := entry.URL != "" || entry.Number != 0 || entry.Status == "created" || entry.Status == "existing"
 		if !trackable {
 			out = append(out, entry)
@@ -247,6 +265,34 @@ func RefreshPRStatuses(prs []PRResult, worktrees []WorktreeBinding) []PRResult {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// bindingBase is the base stored when the worktree was created.
+// Jobs written before that storage fall back to origin/main.
+func bindingBase(b WorktreeBinding) (source, ref, branch string) {
+	source = b.BaseSource
+	ref = b.BaseRef
+	branch = b.BaseBranch
+	if source == "" && ref == "" && branch == "" {
+		ref, branch, _ = ResolveBaseRef(b.PrimaryAbs, "origin", "main")
+		if branch == "" {
+			branch = "main"
+		}
+		if ref == "" {
+			ref = branch
+		}
+		return "origin", ref, branch
+	}
+	if normalizeBaseSource(source) != "local" {
+		source = "origin"
+	}
+	if branch == "" {
+		branch = "main"
+	}
+	if ref == "" {
+		ref = branch
+	}
+	return source, ref, branch
 }
 
 func orMain(s string) string {

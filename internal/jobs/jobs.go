@@ -204,6 +204,7 @@ type PR struct {
 	Error     string         `json:"error,omitempty"`
 	Commits   int            `json:"commits,omitempty"`
 	GhError   string         `json:"ghError,omitempty"`
+	Kind      string         `json:"kind,omitempty"`
 	Extra     map[string]any `json:"-"`
 }
 
@@ -211,6 +212,7 @@ var prOwnedJSON = map[string]bool{
 	"repo": true, "url": true, "ghNumber": true, "number": true,
 	"status": true, "ghState": true, "mergedAt": true, "checkedAt": true,
 	"base": true, "branch": true, "error": true, "commits": true, "ghError": true,
+	"kind": true,
 }
 
 // UnmarshalJSON accepts ghNumber (console) or number (older Go) and stashes
@@ -263,12 +265,13 @@ func (p PR) MarshalJSON() ([]byte, error) {
 		Error     string `json:"error,omitempty"`
 		Commits   int    `json:"commits,omitempty"`
 		GhError   string `json:"ghError,omitempty"`
+		Kind      string `json:"kind,omitempty"`
 	}
 	b, err := json.Marshal(wire{
 		Repo: p.Repo, URL: p.URL, Number: p.Number, Status: p.Status,
 		GhState: p.GhState, MergedAt: p.MergedAt, CheckedAt: p.CheckedAt,
 		Base: p.Base, Branch: p.Branch, Error: p.Error, Commits: p.Commits,
-		GhError: p.GhError,
+		GhError: p.GhError, Kind: p.Kind,
 	})
 	if err != nil {
 		return nil, err
@@ -297,6 +300,7 @@ func prFromResult(p git.PRResult) PR {
 		Repo: p.Repo, URL: p.URL, Number: p.Number, Status: p.Status,
 		GhState: p.GhState, MergedAt: p.MergedAt, CheckedAt: p.CheckedAt, Base: p.Base,
 		Branch: p.Branch, Error: p.Error, Commits: p.Commits, GhError: p.GhError,
+		Kind: p.Kind,
 	}
 }
 
@@ -305,6 +309,7 @@ func prToResult(p PR) git.PRResult {
 		Repo: p.Repo, URL: p.URL, Number: p.Number, Status: p.Status,
 		GhState: p.GhState, MergedAt: p.MergedAt, CheckedAt: p.CheckedAt, Base: p.Base,
 		Branch: p.Branch, Error: p.Error, Commits: p.Commits, GhError: p.GhError,
+		Kind: p.Kind,
 	}
 }
 
@@ -2059,8 +2064,37 @@ func (b *BatchRunner) Stop(jobID string) (*Job, error) {
 	return b.GetJob(jobID), nil
 }
 
-// CreatePRs runs gh pr create for each worktree and writes job.prs[].
-func (b *BatchRunner) CreatePRs(jobID string) (*Job, error) {
+// ShipPreview lists uncommitted files a local Merge would commit.
+func (b *BatchRunner) ShipPreview(jobID string) (git.ShipPreview, error) {
+	b.mu.Lock()
+	j := b.jobs[jobID]
+	if j == nil {
+		b.mu.Unlock()
+		return git.ShipPreview{}, fmt.Errorf("job not found: %s", jobID)
+	}
+	wts := append([]git.WorktreeBinding(nil), j.Worktrees...)
+	batchID := j.BatchID
+	b.mu.Unlock()
+	var titles []string
+	if rec, err := b.GetBatch(batchID); err == nil && rec != nil && b.store != nil {
+		for _, id := range rec.DefectIDs {
+			d, derr := b.store.Get(id)
+			if derr != nil || d == nil {
+				continue
+			}
+			titles = append(titles, d.Title)
+		}
+	}
+	message := suggestShipMessage(titles, b.handoffDir(jobID))
+	if message == "" {
+		message = "Fix defects for " + batchID
+	}
+	return git.PreviewShip(wts, message)
+}
+
+// CreatePRs runs gh pr create or a local merge for each worktree and writes job.prs[].
+// ship.Commit commits uncommitted files on local worktrees first.
+func (b *BatchRunner) CreatePRs(jobID string, ship git.ShipRequest) (*Job, error) {
 	b.mu.Lock()
 	j := b.jobs[jobID]
 	if j == nil {
@@ -2087,18 +2121,18 @@ func (b *BatchRunner) CreatePRs(jobID string) (*Job, error) {
 	if rec, err := b.GetBatch(batchID); err == nil && rec != nil && rec.Title != "" {
 		title = rec.Title
 	}
-	b.appendLog(j, fmt.Sprintf("Create PR: %d worktree(s)…", len(wts)), "info", "DefectDrainer")
-	raw := git.CreatePRsForWorktrees(wts, j.BatchID, title)
+	b.appendLog(j, fmt.Sprintf("Create PR / merge: %d worktree(s)…", len(wts)), "info", "DefectDrainer")
+	raw := git.CreatePRsForWorktrees(wts, j.BatchID, title, ship)
 	prs := make([]PR, 0, len(raw))
 	for _, p := range raw {
 		prs = append(prs, prFromResult(p))
 	}
 	updated := b.UpdatePRs(jobID, prs)
-	created, failed, skipped := 0, 0, 0
+	landed, failed, skipped := 0, 0, 0
 	for _, p := range prs {
 		switch p.Status {
-		case "created", "existing":
-			created++
+		case "created", "existing", "merged":
+			landed++
 		case "failed":
 			failed++
 		default:
@@ -2106,7 +2140,7 @@ func (b *BatchRunner) CreatePRs(jobID string) (*Job, error) {
 		}
 	}
 	if updated != nil {
-		b.appendLog(updated, fmt.Sprintf("Create PR done: %d PR(s), %d failed, %d skipped", created, failed, skipped), "info", "DefectDrainer")
+		b.appendLog(updated, fmt.Sprintf("Create PR / merge done: %d landed, %d failed, %d skipped", landed, failed, skipped), "info", "DefectDrainer")
 	}
 	return b.GetJob(jobID), nil
 }
@@ -2170,7 +2204,7 @@ func (b *BatchRunner) RefreshPRs(jobID string) (*Job, error) {
 
 func hasTrackable(prs []PR) bool {
 	for _, p := range prs {
-		if p.URL != "" || p.Status == "created" || p.Status == "existing" {
+		if p.URL != "" || p.Status == "created" || p.Status == "existing" || p.Status == "merged" || p.Kind == "merge" {
 			return true
 		}
 	}

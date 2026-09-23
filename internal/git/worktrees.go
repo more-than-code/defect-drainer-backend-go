@@ -10,12 +10,27 @@ import (
 )
 
 // WorktreeBinding is one isolated batch worktree.
+// BaseRef is the commit-ish the job branch was cut from. BaseBranch is the
+// name PRs and local merges target. BaseSource is "local" or "origin".
 type WorktreeBinding struct {
 	Repo        string `json:"repo"`
 	PrimaryAbs  string `json:"primaryAbs"`
 	WorktreeAbs string `json:"worktreeAbs"`
 	Branch      string `json:"branch"`
 	RepoURL     string `json:"repoUrl,omitempty"`
+	BaseRef     string `json:"baseRef,omitempty"`
+	BaseBranch  string `json:"baseBranch,omitempty"`
+	BaseSource  string `json:"baseSource,omitempty"`
+}
+
+// WorktreeRequest is one product repo to branch for a batch.
+// Source "local" starts at the local branch. Source "origin" starts at
+// <Remote>/<Branch>, then the local branch if that remote ref is absent.
+type WorktreeRequest struct {
+	PrimaryAbs string
+	Source     string
+	Remote     string
+	Branch     string
 }
 
 func gitC(dir string, args ...string) error {
@@ -39,14 +54,16 @@ func IsGitRepo(dir string) bool {
 	return gitC(dir, "rev-parse", "--is-inside-work-tree") == nil
 }
 
-// CreateBatchWorktrees fail-closed. Branch defect-drainer/<BATCH-id>.
-func CreateBatchWorktrees(batchID, worktreesRoot string, primaryByRepo map[string]string) ([]WorktreeBinding, error) {
-	repos := make([]string, 0, len(primaryByRepo))
-	for r := range primaryByRepo {
-		repos = append(repos, r)
+// CreateBatchWorktrees fail-closed. Branch defect-drainer/<BATCH-id>, cut from
+// each repo's configured base. A missing base fails the batch; it does not
+// fall back to main or HEAD.
+func CreateBatchWorktrees(batchID, worktreesRoot string, repos map[string]WorktreeRequest) ([]WorktreeBinding, error) {
+	names := make([]string, 0, len(repos))
+	for r := range repos {
+		names = append(names, r)
 	}
-	sort.Strings(repos)
-	if len(repos) == 0 {
+	sort.Strings(names)
+	if len(names) == 0 {
 		return nil, fmt.Errorf("no product repos resolved for worktrees — set defect.repos and/or app.repos + workspace_root")
 	}
 	if err := os.MkdirAll(worktreesRoot, 0o755); err != nil {
@@ -54,8 +71,9 @@ func CreateBatchWorktrees(batchID, worktreesRoot string, primaryByRepo map[strin
 	}
 	branch := "defect-drainer/" + batchID
 	var bindings []WorktreeBinding
-	for _, repo := range repos {
-		primaryAbs, err := filepath.Abs(primaryByRepo[repo])
+	for _, repo := range names {
+		req := repos[repo]
+		primaryAbs, err := filepath.Abs(req.PrimaryAbs)
 		if err != nil {
 			RemoveBatchWorktrees(bindings)
 			return nil, err
@@ -68,6 +86,15 @@ func CreateBatchWorktrees(batchID, worktreesRoot string, primaryByRepo map[strin
 			RemoveBatchWorktrees(bindings)
 			return nil, fmt.Errorf("not a git repo: %s", primaryAbs)
 		}
+		source := normalizeBaseSource(req.Source)
+		if source == "origin" {
+			FetchBaseRef(primaryAbs, req.Remote, req.Branch)
+		}
+		ref, baseBranch, err := ResolveJobBase(primaryAbs, source, req.Remote, req.Branch)
+		if err != nil {
+			RemoveBatchWorktrees(bindings)
+			return nil, fmt.Errorf("%s: %w", repo, err)
+		}
 		worktreeAbs := filepath.Join(worktreesRoot, repo)
 		if _, err := os.Stat(worktreeAbs); err == nil {
 			_ = gitC(primaryAbs, "worktree", "remove", "--force", worktreeAbs)
@@ -75,13 +102,13 @@ func CreateBatchWorktrees(batchID, worktreesRoot string, primaryByRepo map[strin
 			_ = gitC(primaryAbs, "worktree", "prune")
 		}
 		_ = gitC(primaryAbs, "branch", "-D", branch)
-		ref, _, _ := ResolveBaseRef(primaryAbs, "origin", "main")
 		if err := gitC(primaryAbs, "worktree", "add", "-b", branch, worktreeAbs, ref); err != nil {
 			RemoveBatchWorktrees(bindings)
 			return nil, fmt.Errorf("git worktree add failed for %s (base=%s, branch=%s): %v", repo, ref, branch, err)
 		}
 		bindings = append(bindings, WorktreeBinding{
 			Repo: repo, PrimaryAbs: primaryAbs, WorktreeAbs: worktreeAbs, Branch: branch,
+			BaseRef: ref, BaseBranch: baseBranch, BaseSource: source,
 		})
 	}
 	return bindings, nil

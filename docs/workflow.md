@@ -1,6 +1,6 @@
 # Agent harness — defect fixing workflow
 
-**defect-drainer** is an **agent harness** for product defect fixing: collect bugs into a durable inventory, then run **bounded AI coding-agent** sessions to fix them in isolated git worktrees, prove the fix, and open PRs.
+**defect-drainer** is an **agent harness** for product defect fixing: collect bugs into a durable inventory, then run **bounded AI coding-agent** sessions to fix them in isolated git worktrees, prove the fix, and ship them — a GitHub pull request, or a merge into the local base branch.
 
 It is **not** tied to one vendor product name, a ticket bus, or a live sprint tracker. Any coding agent that can run headless against a handoff directory (today’s default runner is pluggable; see implementation note) sits **inside** the harness.
 
@@ -13,9 +13,9 @@ It is **not** tied to one vendor product name, a ticket bus, or a live sprint tr
 ```
   Report          Inventory           Harness (batch job)              Ship
   ──────          ─────────           ───────────────────              ────
-  screenshot  →   DEF-* record    →   worktrees + BRIEF + agent   →   Create PR
-  + notes         evidence            baseline → agent → verify        Refresh PR
-                  status/severity     fix_evidence required            merge on GH
+  screenshot  →   DEF-* record    →   worktrees + BRIEF + agent   →   GitHub: Create PR
+  + notes         evidence            baseline → agent → verify        local: Merge
+                  status/severity     fix_evidence required            into the saved base
                                       resolve only if verified         resolve defect
 ```
 
@@ -25,7 +25,7 @@ It is **not** tied to one vendor product name, a ticket bus, or a live sprint tr
 | **2. Inventory** | SQLite SSOT + files under `evidence/` | Triage, select defects, no code changes yet. Console shows local reported time and a gallery for evidence thumbs |
 | **3. Batch fix** | Backend starts a **coding-agent job** with sandbox + worktrees | Each app repo’s Settings row picks GitHub (`origin/<branch>`) or a local checkout path + branch. Code changes only in `defect-drainer/<BATCH-…>` branches |
 | **4. Prove** | Operator / agent uploads **fix evidence**, and DD re-runs the app's **verification commands** itself | Both required before resolve — see [Verification](#verification-who-decides-a-fix-is-real) |
-| **5. Ship** | Host `git` + `gh` (Create PR / Refresh PRs) | PR lifecycle tracked on the job; merge stays on GitHub |
+| **5. Ship** | Host `git`, and `gh` when the repo source is GitHub | A GitHub base opens a PR onto the saved branch. A local checkout shows uncommitted files and a message; confirming commits them onto the job branch, then merges that branch into the local base. The primary tree changes only when it is already on that branch and clean |
 | **6. Close** | Resolve defect with resolution + fix_evidence | Bucket → resolved |
 
 ---
@@ -117,12 +117,12 @@ widened its own sandbox must not have its work resolved.
 
 | Harness concern | How DD handles it |
 |-----------------|-------------------|
-| **Workspace isolation** | `git worktree` per product repo from that repo’s configured base (GitHub remote-tracking ref or local committed branch); never edit primary checkouts |
+| **Workspace isolation** | `git worktree` per product repo from that repo’s saved base (GitHub: `<remote>/<branch>`; local: the local branch). The agent does not edit the primary checkout. A later local Merge updates the primary only when it is already on that base and clean |
 | **Permissions / sandbox** | OS-level sandbox profiles (`strict` / `workspace`) per app |
 | **Brief / handoff** | `BRIEF.md` (role, facts, decisions, deliverables, defects) + `PROCESS.md` (worker contract) + `SKILLS.md` (per-worktree skill and contract paths) under the job handoff dir |
 | **Observability** | Job log stream (harness lines vs agent lines) |
 | **Stop / resume / re-run** | Console job actions; the server decides which restarts a job allows and says why not |
-| **Deterministic ops** | Create PR, refresh merge state, resolve — host tools, not “hope the model did it” |
+| **Deterministic ops** | Create PR or local Merge (from the repo's base source), refresh that state, resolve — host tools, not “hope the model did it” |
 
 The **coding agent is a worker inside the harness**, not the product. The harness owns inventory, gates (fix-backed-by-evidence), and git/PR actions.
 
