@@ -4,7 +4,9 @@
 
 It is **not** tied to one vendor product name, a ticket bus, or a live sprint tracker. Any coding agent that can run headless against a handoff directory (today’s default runner is pluggable; see implementation note) sits **inside** the harness.
 
-**Search & analytics** (multi-artifact find, defect-kind and prompt-use analytics, OpenSearch plan): see [search-and-analytics.md](search-and-analytics.md).
+**Operating it** (starting fixes, job states, Stop / Resume / Re-run / a fresh job, restarting the backend safely): see [operating.md](operating.md).
+
+**Search & analytics** (multi-artifact find, defect-kind and prompt-use analytics, OpenSearch plan): see [search-and-analytics.md](../../docs/search-and-analytics.md).
 
 ---
 
