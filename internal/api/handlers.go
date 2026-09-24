@@ -24,9 +24,14 @@ func (a *App) postApp(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rec, err := store.CreateApp(a.DB, appFromMap(body))
+	recIn, err := appFromMap(body)
 	if err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		writeOpErr(w, err)
+		return
+	}
+	rec, err := store.CreateApp(a.DB, recIn)
+	if err != nil {
+		writeOpErr(w, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"app": rec})
@@ -42,13 +47,14 @@ func (a *App) patchApp(w http.ResponseWriter, r *http.Request) {
 	for k := range body {
 		has[k] = true
 	}
-	rec, err := store.UpdateAppSettings(a.DB, r.PathValue("id"), appFromMap(body), has)
+	recIn, err := appFromMap(body)
 	if err != nil {
-		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "unknown") {
-			code = http.StatusNotFound
-		}
-		httpx.WriteError(w, code, err.Error())
+		writeOpErr(w, err)
+		return
+	}
+	rec, err := store.UpdateAppSettings(a.DB, r.PathValue("id"), recIn, has)
+	if err != nil {
+		writeOpErr(w, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"app": rec})
@@ -66,7 +72,7 @@ func (a *App) deleteApp(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func appFromMap(b map[string]any) store.AppRecord {
+func appFromMap(b map[string]any) (store.AppRecord, error) {
 	var rec store.AppRecord
 	rec.Name, _ = b["name"].(string)
 	rec.Description, _ = b["description"].(string)
@@ -95,7 +101,14 @@ func appFromMap(b map[string]any) store.AppRecord {
 	if raw, ok := b["repo_entries"]; ok {
 		rec.RepoEntries = parseEntries(raw)
 	}
-	return rec
+	if raw, ok := b["test_accounts"]; ok {
+		accounts, err := store.ParseTestAccounts(raw)
+		if err != nil {
+			return store.AppRecord{}, err
+		}
+		rec.TestAccounts = accounts
+	}
+	return rec, nil
 }
 
 func parseVerifyCommands(raw any) []store.VerifyCommand {

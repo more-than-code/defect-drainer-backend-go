@@ -437,13 +437,33 @@ func (s *Store) Delete(id string, wipeEvidence bool) (bool, error) {
 }
 
 // SaveEvidence writes 01.png / fix-01.png style files.
-func (s *Store) SaveEvidence(id string, files []struct{ Filename string; Data []byte }, kind string) ([]string, error) {
+func (s *Store) SaveEvidence(id string, files []struct {
+	Filename string
+	Data     []byte
+}, kind string) ([]string, error) {
 	if !IsSafeID(id) {
 		return nil, fmt.Errorf("invalid defect id: %s", id)
 	}
 	if kind == "" {
 		kind = "report"
 	}
+	prefix := ""
+	if kind == "fix" {
+		prefix = "fix-"
+	}
+	out, err := s.writeNumberedEvidence(id, prefix, files)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// writeNumberedEvidence stores prefix+NN.ext under evidence/<id>/.
+// Callers choose the id gate; defect messages stay on SaveEvidence.
+func (s *Store) writeNumberedEvidence(id, prefix string, files []struct {
+	Filename string
+	Data     []byte
+}) ([]string, error) {
 	dir := filepath.Join(paths.EvidenceDir(s.DefectsRoot), id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -455,35 +475,36 @@ func (s *Store) SaveEvidence(id string, files []struct{ Filename string; Data []
 			used[e.Name()] = true
 		}
 	}
-	prefix := ""
-	if kind == "fix" {
-		prefix = "fix-"
-	}
 	var out []string
 	n := 1
 	for _, f := range files {
-		ext := strings.ToLower(filepath.Ext(f.Filename))
-		if ext == "" {
-			ext = ".png"
-		}
-		switch ext {
-		case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic":
-		default:
-			ext = ".png"
-		}
+		ext := evidenceExt(f.Filename)
 		name := fmt.Sprintf("%s%02d%s", prefix, n, ext)
 		for used[name] {
 			n++
 			name = fmt.Sprintf("%s%02d%s", prefix, n, ext)
 		}
 		if err := os.WriteFile(filepath.Join(dir, name), f.Data, 0o644); err != nil {
-			return nil, err
+			return out, err
 		}
 		used[name] = true
 		out = append(out, fmt.Sprintf("evidence/%s/%s", id, name))
 		n++
 	}
 	return out, nil
+}
+
+func evidenceExt(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == "" {
+		ext = ".png"
+	}
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic":
+		return ext
+	default:
+		return ".png"
+	}
 }
 
 // SyncDefectFTS updates the FTS row; errors are swallowed by callers like TS.

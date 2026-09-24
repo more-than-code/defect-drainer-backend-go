@@ -111,12 +111,15 @@ type AppRecord struct {
 	AgentMaxTurns int `json:"agent_max_turns,omitempty"`
 	// VerifyCommands are re-run by DD after a fix job; all must pass to resolve.
 	VerifyCommands []VerifyCommand `json:"verify_commands,omitempty"`
-	BaseRemote     string          `json:"base_remote,omitempty"`
-	BaseBranch     string          `json:"base_branch,omitempty"`
-	Default        bool            `json:"default"`
+	// TestAccounts are operator login hints. Passwords are never stored.
+	TestAccounts    []TestAccount `json:"test_accounts"`
+	testAccountsRaw string        `json:"-"`
+	BaseRemote      string        `json:"base_remote,omitempty"`
+	BaseBranch      string        `json:"base_branch,omitempty"`
+	Default         bool          `json:"default"`
 }
 
-const appSelect = `id, name, description, workspace_root, repos_json, repo_url, repo_urls_json, grok_sandbox, agent_toolchain, allow_simulator_writes, verify_commands_json, base_remote, base_branch, agent_max_turns, is_default`
+const appSelect = `id, name, description, workspace_root, repos_json, repo_url, repo_urls_json, grok_sandbox, agent_toolchain, allow_simulator_writes, verify_commands_json, base_remote, base_branch, agent_max_turns, is_default, test_accounts_json`
 
 func nameFromRepoURL(url string) string {
 	u := strings.TrimRight(url, "/")
@@ -315,7 +318,7 @@ func persistRepoColumns(entries []AppRepoEntry) (reposJSON string, repoURL sql.N
 	return
 }
 
-func rowToApp(id, name string, description, workspace, reposJSON, repoURL, repoURLsJSON, sandbox, toolchain, verifyJSON, remote, branch sql.NullString, simWrites, maxTurns, isDefault int) AppRecord {
+func rowToApp(id, name string, description, workspace, reposJSON, repoURL, repoURLsJSON, sandbox, toolchain, verifyJSON, remote, branch, accountsJSON sql.NullString, simWrites, maxTurns, isDefault int) AppRecord {
 	entries := parseStoredRepoEntries(repoURLsJSON.String, repoURL.String, reposJSON.String)
 	var urls []string
 	var names []string
@@ -339,6 +342,8 @@ func rowToApp(id, name string, description, workspace, reposJSON, repoURL, repoU
 		AgentToolchain:       ParseAgentToolchain(toolchain.String),
 		AllowSimulatorWrites: simWrites != 0,
 		VerifyCommands:       parseStoredVerifyCommands(verifyJSON.String),
+		TestAccounts:         parseStoredTestAccounts(accountsJSON.String),
+		testAccountsRaw:      storedTestAccountsJSON(accountsJSON.String),
 		BaseRemote:           ParseGitRefName(remote.String, "origin"),
 		BaseBranch:           ParseGitRefName(branch.String, "main"),
 		AgentMaxTurns:        NormalizeAgentMaxTurns(maxTurns),
@@ -362,12 +367,12 @@ func scanApp(scanner interface {
 	Scan(dest ...any) error
 }) (AppRecord, error) {
 	var id, name string
-	var desc, ws, reposJSON, repoURL, urlsJSON, sandbox, toolchain, verifyJSON, remote, branch sql.NullString
+	var desc, ws, reposJSON, repoURL, urlsJSON, sandbox, toolchain, verifyJSON, remote, branch, accountsJSON sql.NullString
 	var simWrites, maxTurns, isDefault int
-	if err := scanner.Scan(&id, &name, &desc, &ws, &reposJSON, &repoURL, &urlsJSON, &sandbox, &toolchain, &simWrites, &verifyJSON, &remote, &branch, &maxTurns, &isDefault); err != nil {
+	if err := scanner.Scan(&id, &name, &desc, &ws, &reposJSON, &repoURL, &urlsJSON, &sandbox, &toolchain, &simWrites, &verifyJSON, &remote, &branch, &maxTurns, &isDefault, &accountsJSON); err != nil {
 		return AppRecord{}, err
 	}
-	return rowToApp(id, name, desc, ws, reposJSON, repoURL, urlsJSON, sandbox, toolchain, verifyJSON, remote, branch, simWrites, maxTurns, isDefault), nil
+	return rowToApp(id, name, desc, ws, reposJSON, repoURL, urlsJSON, sandbox, toolchain, verifyJSON, remote, branch, accountsJSON, simWrites, maxTurns, isDefault), nil
 }
 
 // ListApps ORDER BY is_default DESC, name ASC.
@@ -393,8 +398,12 @@ func ListApps(sqlDB *sql.DB) ([]AppRecord, error) {
 
 // GetApp canonicalizes id and returns the row or nil.
 func GetApp(sqlDB *sql.DB, appID string) (*AppRecord, error) {
+	return getApp(sqlDB, appID)
+}
+
+func getApp(q rower, appID string) (*AppRecord, error) {
 	id := CanonicalizeAppID(appID)
-	row := sqlDB.QueryRow(`SELECT `+appSelect+` FROM apps WHERE id = ?`, id)
+	row := q.QueryRow(`SELECT `+appSelect+` FROM apps WHERE id = ?`, id)
 	rec, err := scanApp(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -507,6 +516,10 @@ func CreateApp(sqlDB *sql.DB, input AppRecord) (AppRecord, error) {
 	if makeDefault {
 		_, _ = sqlDB.Exec(`UPDATE apps SET is_default = 0`)
 	}
+	accounts, err := NormalizeTestAccounts(input.TestAccounts)
+	if err != nil {
+		return AppRecord{}, err
+	}
 	ts := db.NowIso()
 	def := 0
 	if makeDefault {
@@ -519,15 +532,17 @@ func CreateApp(sqlDB *sql.DB, input AppRecord) (AppRecord, error) {
 	if strings.TrimSpace(input.WorkspaceRoot) != "" {
 		ws = strings.TrimSpace(input.WorkspaceRoot)
 	}
-	_, err := sqlDB.Exec(`
+	_, err = sqlDB.Exec(`
     INSERT INTO apps (
       id, name, description, workspace_root, repos_json, repo_url, repo_urls_json,
       grok_sandbox, agent_toolchain, allow_simulator_writes, verify_commands_json,
+      test_accounts_json,
       base_remote, base_branch, agent_max_turns, is_default, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, name, desc, ws, reposJSON, nullStr(repoURL), urlsJSON,
 		sandbox, ParseAgentToolchain(input.AgentToolchain), boolToInt(input.AllowSimulatorWrites),
 		mustJSON(NormalizeVerifyCommands(input.VerifyCommands)),
+		mustJSON(accounts),
 		ParseGitRefName(input.BaseRemote, "origin"), ParseGitRefName(input.BaseBranch, "main"),
 		NormalizeAgentMaxTurns(input.AgentMaxTurns),
 		def, ts, ts,
@@ -614,6 +629,18 @@ func UpdateAppSettings(sqlDB *sql.DB, appID string, patch AppRecord, has map[str
 	if has["verify_commands"] {
 		next.VerifyCommands = NormalizeVerifyCommands(patch.VerifyCommands)
 	}
+	accountsJSON := next.testAccountsRaw
+	if accountsJSON == "" {
+		accountsJSON = "[]"
+	}
+	if has["test_accounts"] {
+		accounts, err := NormalizeTestAccounts(patch.TestAccounts)
+		if err != nil {
+			return AppRecord{}, err
+		}
+		next.TestAccounts = accounts
+		accountsJSON = mustJSON(accounts)
+	}
 	if has["base_remote"] {
 		next.BaseRemote = ParseGitRefName(patch.BaseRemote, "origin")
 	}
@@ -673,14 +700,15 @@ func UpdateAppSettings(sqlDB *sql.DB, appID string, patch AppRecord, has map[str
 	_, err = sqlDB.Exec(`UPDATE apps SET
       name = ?, description = ?, workspace_root = ?, repos_json = ?,
       repo_url = ?, repo_urls_json = ?, grok_sandbox = ?, agent_toolchain = ?,
-      allow_simulator_writes = ?, verify_commands_json = ?, base_remote = ?,
-      base_branch = ?, agent_max_turns = ?, is_default = ?, updated_at = ?
+      allow_simulator_writes = ?, verify_commands_json = ?, test_accounts_json = ?,
+      base_remote = ?, base_branch = ?, agent_max_turns = ?, is_default = ?, updated_at = ?
      WHERE id = ?`,
 		next.Name, desc, ws, reposJSON, nullStr(repoURL), urlsJSON,
 		ParseGrokSandbox(next.GrokSandbox),
 		ParseAgentToolchain(next.AgentToolchain),
 		boolToInt(next.AllowSimulatorWrites),
 		mustJSON(NormalizeVerifyCommands(next.VerifyCommands)),
+		accountsJSON,
 		ParseGitRefName(next.BaseRemote, "origin"),
 		ParseGitRefName(next.BaseBranch, "main"),
 		NormalizeAgentMaxTurns(next.AgentMaxTurns),

@@ -114,6 +114,22 @@ func (a *App) mux() http.Handler {
 	m.HandleFunc("GET /api/apps/{id}", a.getApp)
 	m.HandleFunc("PATCH /api/apps/{id}", a.patchApp)
 	m.HandleFunc("DELETE /api/apps/{id}", a.deleteApp)
+	m.HandleFunc("GET /api/test-plans", a.getTestPlans)
+	m.HandleFunc("POST /api/test-plans", a.postTestPlan)
+	m.HandleFunc("GET /api/test-plans/{id}", a.getTestPlan)
+	m.HandleFunc("PATCH /api/test-plans/{id}", a.patchTestPlan)
+	m.HandleFunc("DELETE /api/test-plans/{id}", a.deleteTestPlan)
+	m.HandleFunc("GET /api/test-runs", a.getTestRuns)
+	m.HandleFunc("POST /api/test-runs", a.postTestRun)
+	m.HandleFunc("GET /api/test-runs/{id}", a.getTestRun)
+	m.HandleFunc("DELETE /api/test-runs/{id}", a.deleteTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/steps", a.postTestRunStep)
+	m.HandleFunc("PATCH /api/test-runs/{id}/steps/{key}", a.patchTestRunStep)
+	m.HandleFunc("POST /api/test-runs/{id}/steps/{key}/evidence", a.postTestRunStepEvidence)
+	m.HandleFunc("POST /api/test-runs/{id}/finish", a.finishTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/abandon", a.abandonTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/review", a.reviewTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/save-as-plan", a.saveTestRunAsPlan)
 	m.HandleFunc("GET /api/defects", a.getDefects)
 	m.HandleFunc("GET /api/defects/{id}", a.getDefect)
 	m.HandleFunc("PATCH /api/defects/{id}", a.patchDefect)
@@ -265,7 +281,7 @@ func (a *App) getDefect(w http.ResponseWriter, r *http.Request) {
 func (a *App) getEvidence(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	file := r.PathValue("file")
-	if !store.IsSafeID(id) || strings.Contains(file, "..") || strings.Contains(file, "/") || strings.Contains(file, `\`) {
+	if !store.IsEvidenceOwnerID(id) || strings.Contains(file, "..") || strings.Contains(file, "/") || strings.Contains(file, `\`) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid path")
 		return
 	}
@@ -301,16 +317,20 @@ func (a *App) getEvidence(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, abs)
 }
 
-// evidenceDirRequired refuses to start when a defect row references evidence
-// files and those files are not in {DEFECTS_ROOT}/evidence. It does not create
-// anything. A directory with none of the referenced files (empty, or nested
-// one level too deep) is not enough.
+// evidenceDirRequired refuses to start when a defect or test-step row references
+// evidence files and those files are not in {DEFECTS_ROOT}/evidence. It does not
+// create anything. A directory with none of the referenced files (empty, or nested
+// one level too deep) is not enough. The refusal text stays the same either way.
 func evidenceDirRequired(sqlDB *sql.DB, defectsRoot string) error {
 	var n int
 	err := sqlDB.QueryRow(`
-		SELECT COUNT(*) FROM defects
-		WHERE json_array_length(evidence_json) > 0
-		   OR json_array_length(fix_evidence_json) > 0
+		SELECT
+		  (SELECT COUNT(*) FROM defects
+		    WHERE json_array_length(evidence_json) > 0
+		       OR json_array_length(fix_evidence_json) > 0)
+		  +
+		  (SELECT COUNT(*) FROM test_step_results
+		    WHERE json_array_length(evidence_json) > 0)
 	`).Scan(&n)
 	if err != nil {
 		return err
@@ -328,6 +348,8 @@ func evidenceDirRequired(sqlDB *sql.DB, defectsRoot string) error {
 			SELECT value FROM defects, json_each(evidence_json)
 			UNION ALL
 			SELECT value FROM defects, json_each(fix_evidence_json)
+			UNION ALL
+			SELECT value FROM test_step_results, json_each(evidence_json)
 		) LIMIT 50
 	`)
 	if err != nil {

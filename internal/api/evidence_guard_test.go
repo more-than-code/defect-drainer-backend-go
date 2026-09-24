@@ -136,6 +136,67 @@ func TestBuildAllowsEvidenceDirWhenPresent(t *testing.T) {
 	t.Cleanup(app.Close)
 }
 
+func TestBuildRefusesMissingStepEvidence(t *testing.T) {
+	defects := t.TempDir()
+	data := t.TempDir()
+	cwd := t.TempDir()
+	const runID = "TRUN-20260924-abcdef01"
+	seedStepEvidence(t, defects, data, cwd, "evidence/"+runID+"/s-login-01.png")
+
+	app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, Cwd: cwd, SkipMigrate: true})
+	if err == nil {
+		app.Close()
+		t.Fatal("expected refusal when a step references evidence that is missing")
+	}
+	assertNoReferencedEvidence(t, err, paths.EvidenceDir(defects))
+}
+
+func TestBuildStartsWhenStepEvidenceExists(t *testing.T) {
+	defects := t.TempDir()
+	data := t.TempDir()
+	cwd := t.TempDir()
+	const runID = "TRUN-20260924-abcdef01"
+	seedStepEvidence(t, defects, data, cwd, "evidence/"+runID+"/s-login-01.png")
+	dir := filepath.Join(paths.EvidenceDir(defects), runID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "s-login-01.png"), []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, Cwd: cwd, SkipMigrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.Close)
+}
+
+func seedStepEvidence(t *testing.T, defects, data, cwd, rel string) {
+	t.Helper()
+	app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, Cwd: cwd, SkipMigrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const runID = "TRUN-20260924-abcdef01"
+	now := "2026-09-24T00:00:00.000Z"
+	_, err = app.DB.Exec(`INSERT INTO test_runs (
+		id, app_id, title, executor, status, started_at, created_at, updated_at
+	) VALUES (?, ?, 't', 'operator', 'in_progress', ?, ?, ?)`,
+		runID, store.SeededTutoredWebappAppID, now, now, now)
+	if err != nil {
+		app.Close()
+		t.Fatal(err)
+	}
+	_, err = app.DB.Exec(`INSERT INTO test_step_results (
+		run_id, step_key, position, action, evidence_json, updated_at
+	) VALUES (?, 'login', 1, 'Sign in', ?, ?)`, runID, `["`+rel+`"]`, now)
+	app.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuildAllowsEmptyDBWithoutEvidenceDir(t *testing.T) {
 	defects := t.TempDir()
 	data := t.TempDir()
