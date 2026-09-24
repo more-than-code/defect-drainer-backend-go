@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/joe/defect-drainer-go/internal/env"
 )
@@ -245,6 +246,12 @@ type agentStream struct {
 	onEnd      func(AgentEnd)
 	onMaxTurns func()
 	pend       []byte
+	// pendLimit caps a newline-less stdout blob. Zero keeps maxAgentLogBytes
+	// so production stays at 8 MiB; tests set a smaller value.
+	pendLimit int
+	// textPend joins word-sized `text` deltas. Write runs on os/exec's copy
+	// loop and Flush runs after Wait, so this buffer needs no lock.
+	textPend []byte
 }
 
 func (a *agentStream) Write(p []byte) (int, error) {
@@ -257,7 +264,10 @@ func (a *agentStream) Write(p []byte) (int, error) {
 		if i < 0 {
 			// A child dumping a huge blob with no newline must not grow this
 			// buffer without bound. Drop it with a marker rather than unmarshal.
-			if len(a.pend) > maxAgentLogBytes {
+			if len(a.pend) > a.pendCap() {
+				// Prose already parsed must stay ahead of the marker. The
+				// blob itself is dropped; agent.log already has the bytes.
+				a.flushText()
 				a.emit(a.text, logTruncateMark)
 				a.pend = a.pend[:0]
 			}
@@ -268,6 +278,13 @@ func (a *agentStream) Write(p []byte) (int, error) {
 		a.handle(line)
 	}
 	return len(p), nil
+}
+
+func (a *agentStream) pendCap() int {
+	if a != nil && a.pendLimit > 0 {
+		return a.pendLimit
+	}
+	return maxAgentLogBytes
 }
 
 func (a *agentStream) emit(f *lineForwarder, line string) {
@@ -285,68 +302,183 @@ func (a *agentStream) handle(line []byte) {
 	// Non-JSON: an older CLI, or a fake bin in tests that echoes argv. Keep it
 	// as an ordinary log line rather than discarding the run's only output.
 	if t[0] != '{' {
+		a.flushText()
 		a.emit(a.text, string(t))
 		return
 	}
-	var ev struct {
-		Type    string `json:"type"`
-		Text    string `json:"text"`
-		Message string `json:"message"`
-		Content string `json:"content"`
-		AgentEnd
+	// Type only. tool_call and tool_call_update carry `content` as an array
+	// (1.0.40); decoding that field as a string fails the whole event and
+	// would dump the raw line into the job log. `end` is decoded on its own
+	// so a nested `usage` object does not disturb AgentEnd.
+	var head struct {
+		Type string `json:"type"`
 	}
-	if err := json.Unmarshal(t, &ev); err != nil {
-		a.emit(a.text, string(t))
+	if err := json.Unmarshal(t, &head); err != nil {
+		// A truncated tool_call_update is still one `{` line, tens of KB.
+		// The bytes are in agent.log; the job log gets a length, not the body.
+		a.flushText()
+		a.emit(a.text, fmt.Sprintf("invalid agent event (%d bytes; see agent.log)", len(t)))
 		return
 	}
-	switch ev.Type {
+	switch head.Type {
 	case "text":
-		// The `end` shape is verified against 1.0.40; this payload field is
-		// not, so fall back through the candidates and finally to the raw line.
-		// Losing the agent's output to a field-name guess is worse than noise.
-		payload := ev.Text
-		if payload == "" {
-			payload = ev.Message
-		}
-		if payload == "" {
-			payload = ev.Content
-		}
-		if payload == "" {
-			payload = string(t)
-		}
-		a.emit(a.text, payload)
-	case "thought":
-		// agent.log only. Reasoning is not the operator's job log.
+		a.appendText(textPayload(t))
 	case "end":
+		a.flushText()
+		var ev struct{ AgentEnd }
+		if err := json.Unmarshal(t, &ev); err != nil {
+			a.emit(a.text, string(t))
+			return
+		}
 		if a.onEnd != nil {
 			a.onEnd(ev.AgentEnd)
 		}
 	case "max_turns_reached":
 		// The positive signal for turn exhaustion, which also exits non-zero.
+		a.flushText()
 		if a.onMaxTurns != nil {
 			a.onMaxTurns()
 		}
 	case "error":
+		a.flushText()
+		// message, with content kept as a string so a non-string content still
+		// falls through to the raw line the way the shared decode used to.
+		var ev struct {
+			Message string `json:"message"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(t, &ev); err != nil {
+			a.emit(a.text, string(t))
+			return
+		}
 		msg := ev.Message
 		if msg == "" {
 			msg = string(t)
 		}
 		a.emit(a.errs, "agent error: "+msg)
 	default:
-		// tool_call, tool_call_update, usage, available_commands, and whatever
-		// a later version adds. agent.log keeps them; job.log stays readable.
+		// thought, tool_call, tool_call_update, usage, available_commands, and
+		// whatever a later version adds. agent.log keeps them; job.log stays
+		// readable. Flush first so prose before the event is one line.
+		a.flushText()
 	}
 }
 
-// Flush handles a trailing line with no newline, so a final `end` on a stream
-// that does not end in \n is still recorded.
-func (a *agentStream) Flush() {
-	if len(a.pend) == 0 {
+// textPayload is the operator-visible body of a text event. Grok 1.0.40 sends
+// `data`. Older shapes use text, then message, then content. Each key is read
+// on its own so a sibling that is not a string (content:[] or text:1) does
+// not drop a string sitting next to it. Absent, null, non-string, and empty
+// values are skipped. No string payload logs nothing.
+func textPayload(raw []byte) string {
+	var ev map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return ""
+	}
+	for _, key := range []string{"data", "text", "message", "content"} {
+		v, ok := ev[key]
+		if !ok || len(v) == 0 || string(v) == "null" {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			continue
+		}
+		if s == "" {
+			continue
+		}
+		return s
+	}
+	return ""
+}
+
+func (a *agentStream) appendText(payload string) {
+	if payload == "" {
 		return
 	}
-	line := a.pend
-	a.pend = nil
-	a.handle(line)
+	a.textPend = append(a.textPend, payload...)
+	a.takeTextLines()
+}
+
+// takeTextLines emits completed lines and any maxLogBlock chunk. A short
+// partial stays buffered. Newline-terminated lines keep their own spacing;
+// a line that is only whitespace is dropped.
+func (a *agentStream) takeTextLines() {
+	for len(a.textPend) > 0 {
+		end := len(a.textPend)
+		if end > maxLogBlock {
+			end = maxLogBlock
+		}
+		if i := bytes.IndexByte(a.textPend[:end], '\n'); i >= 0 {
+			line := string(a.textPend[:i])
+			a.textPend = a.textPend[i+1:]
+			if strings.TrimSpace(line) != "" {
+				a.emit(a.text, line)
+			}
+			continue
+		}
+		if len(a.textPend) < maxLogBlock {
+			break
+		}
+		cut := textCut(a.textPend)
+		if cut < 1 {
+			cut = 1
+		}
+		chunk := string(a.textPend[:cut])
+		a.textPend = a.textPend[cut:]
+		if strings.TrimSpace(chunk) != "" {
+			a.emit(a.text, chunk)
+		}
+	}
+	// Drop the backing array of a huge delta once the live partial is short,
+	// so one long event cannot pin megabytes for the rest of the run.
+	if cap(a.textPend) > maxLogBlock {
+		a.textPend = append([]byte(nil), a.textPend...)
+	}
+}
+
+// textCut is the next chunk length for a buffer that has reached maxLogBlock
+// with no newline in that window. If a UTF-8 rune straddles the cap, the cut
+// moves back at most 3 bytes to the rune start so the partial rune stays
+// buffered. A window of continuation bytes still returns at least one byte.
+func textCut(buf []byte) int {
+	cut := maxLogBlock
+	if cut > len(buf) {
+		cut = len(buf)
+	}
+	if cut == 0 {
+		return 0
+	}
+	if cut < len(buf) && !utf8.RuneStart(buf[cut]) {
+		for n := 1; n <= 3 && cut-n > 0; n++ {
+			if utf8.RuneStart(buf[cut-n]) {
+				return cut - n
+			}
+		}
+	}
+	return cut
+}
+
+// flushText emits the short partial as one trimmed line.
+func (a *agentStream) flushText() {
+	a.takeTextLines()
+	if s := strings.TrimSpace(string(a.textPend)); s != "" {
+		a.emit(a.text, s)
+	}
+	a.textPend = nil
+}
+
+// Flush handles a trailing line with no newline, so a final `end` on a stream
+// that does not end in \n is still recorded. Pending prose is emitted after
+// that line is parsed: a trailing text event still joins the partial, and a
+// trailing end / max_turns_reached / error flushes inside handle before its
+// callback or stderr write.
+func (a *agentStream) Flush() {
+	if len(a.pend) > 0 {
+		line := a.pend
+		a.pend = nil
+		a.handle(line)
+	}
+	a.flushText()
 }
 
 func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, worktrees []WorktreeBinding, opts *CodingAgentOpts) string {
