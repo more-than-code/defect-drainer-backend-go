@@ -18,14 +18,15 @@ cd /Users/joe/workspace/defect-drainer/backend-go
 go test ./...
 go run ./cmd/defect-drainer serve
 # → http://127.0.0.1:8788
-# DEFECTS_ROOT = umbrella; DEFECT_DRAINER_DATA = this module's .data when that DB exists.
+# DEFECTS_ROOT defaults to this module's .data (same directory as the DB) when unset.
+# DEFECT_DRAINER_DATA = this module's .data when that DB exists.
 ```
 
 Or `make serve` / `make test` / `make build` (`CGO_ENABLED=0`). Cross-compile: `make cross-linux`.
 
 ## One-writer rule
 
-The inventory is **one SQLite file** plus umbrella `evidence/`. Only one backend process (TS **or** Go) may write a given data dir.
+The inventory is **one SQLite file** plus `evidence/` inside that data dir (`.data/evidence`). Only one backend process (TS **or** Go) may write a given data dir.
 
 - Mutex: both TS (`koffi` → `libc.flock`) and Go (`syscall.Flock`) take `LOCK_EX|LOCK_NB` on `{DATA}/defect-drainer.lock`. A second locker fails immediately and does not listen.
 - Operator backup: never start two servers against one data dir.
@@ -34,7 +35,7 @@ The inventory is **one SQLite file** plus umbrella `evidence/`. Only one backend
 
 | Env | Role |
 |-----|------|
-| `DEFECTS_ROOT` | Inventory / `evidence/` (no `DEFECT_DRAINER_` prefix) |
+| `DEFECTS_ROOT` | Directory that contains `evidence/` (defaults to the data dir; no `DEFECT_DRAINER_` prefix) |
 | `DEFECT_DRAINER_DATA` | Runtime: `defect-drainer.db`, `jobs/`, `batch-jobs/`, `clones/` |
 | `DEFECT_DRAINER_HOST` / `PORT` | Listen (default `127.0.0.1:8788`) |
 
@@ -42,11 +43,11 @@ Legacy `DEFECT_CHANNEL_*` is still read. `.env` is only `backend-go/.env`, loade
 
 If those roots cannot be resolved (PATH-installed binary, no `go.mod` in cwd, no existing `backend-go/.data/defect-drainer.db`), the process **exits 1**. It will not mkdir a second inventory.
 
-From `backend-go/` in this umbrella, `serve` already picks that SSOT. Override only when the binary cannot see the tree:
+From `backend-go/` in this umbrella, `serve` already picks that SSOT: both roots default to this module's `.data`. Override only when the binary cannot see the tree:
 
 ```bash
-export DEFECTS_ROOT=/Users/joe/workspace/defect-drainer
 export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend-go/.data
+export DEFECTS_ROOT=/Users/joe/workspace/defect-drainer/backend-go/.data
 ```
 
 `healthcheck` uses **HOST/PORT only** (default `127.0.0.1:8788`). It does not walk `go.mod`, flock, or open SQLite.

@@ -24,7 +24,7 @@ It is **not** tied to one vendor product name, a ticket bus, or a live sprint tr
 | Stage | Who / what | Outcome |
 |-------|------------|---------|
 | **1. Report** | Operator (console), script/API, or coding agent | Structured defect + report evidence. `reporter` = who filed; `source` = how detected |
-| **2. Inventory** | SQLite SSOT + files under `evidence/` | Triage, select defects, no code changes yet. Console shows local reported time and a gallery for evidence thumbs |
+| **2. Inventory** | SQLite SSOT + files under `.data/evidence/` | Triage, select defects, no code changes yet. Console shows local reported time and a gallery for evidence thumbs |
 | **3. Batch fix** | Backend starts a **coding-agent job** with sandbox + worktrees | Each app repo’s Settings row picks GitHub (`origin/<branch>`) or a local checkout path + branch. Code changes only in `defect-drainer/<BATCH-…>` branches |
 | **4. Prove** | Operator / agent uploads **fix evidence**, and DD re-runs the app's **verification commands** itself | Both required before resolve — see [Verification](#verification-who-decides-a-fix-is-real) |
 | **5. Ship** | Host `git`, and `gh` when the repo source is GitHub | A GitHub base opens a PR onto the saved branch. A local checkout shows uncommitted files and a message; confirming commits them onto the job branch, then merges that branch into the local base. The primary tree changes only when it is already on that branch and clean |

@@ -191,3 +191,48 @@ If `serve` stopped while a job ran (crash, kill, Ctrl-C mid-job), that job comes
 
 `go test` runs of this repo spawn fake agents the same way. An interrupted test run can leave
 one behind under a temp dir (`pgrep -fl fake-grok`); it is safe to kill.
+
+## Moving evidence into the data dir (one-time, 2026-09-24)
+
+Screenshots used to live at `<umbrella>/evidence`. They now live at
+`<umbrella>/backend-go/.data/evidence`, next to the database. `serve` will not move,
+create, or delete them to fix the layout. Do this once, by hand:
+
+1. Check for no running jobs (nothing `running` or `queued`):
+   ```bash
+   curl -s http://127.0.0.1:8788/api/batches | python3 -c 'import json,sys; print([(j["jobId"], j["status"]) for j in json.load(sys.stdin)["jobs"] if j["status"] in ("running","queued")])'
+   ```
+2. Stop `serve`.
+3. Confirm the port is free (`lsof -nP -iTCP:8788 -sTCP:LISTEN` prints nothing).
+4. If `<umbrella>/backend-go/.data/evidence` already exists, **stop**. Merge
+   `<umbrella>/evidence` into it by hand. `mv` onto an existing directory nests the
+   folder, which leaves the screenshots at `evidence/evidence/<DEF>/…`.
+5. Otherwise: `mv <umbrella>/evidence <umbrella>/backend-go/.data/evidence`
+6. Start **this** build of `serve`. A pre-change build recreates an empty
+   `<umbrella>/evidence`. If that happens, remove the empty directory with `rmdir`.
+   Never copy that empty directory over the tree in the data dir.
+
+Deleting `backend-go/.data` now also deletes the screenshots.
+
+`serve` refuses to start, and leaves the files where they are, when:
+
+- The error prints `mv` with both paths single-quoted. `DEFECTS_ROOT` was left unset
+  and `<umbrella>/evidence` is still there, while `<data>/evidence` is not. Run that
+  command after the stop steps above, then start this build again.
+- The error says the legacy directory is empty and prints `rmdir`. Both directories
+  exist and the legacy one has no entries — an older build recreated it after the
+  move. The screenshots are already in `<data>/evidence`. `rmdir` the legacy
+  directory. Do not copy it over the data-dir tree.
+- The error says to merge them by hand. Both directories exist and the legacy one
+  still has files. Combine those files into `<data>/evidence` yourself. Do not `mv`
+  onto the directory that is already there.
+- The error says the evidence directory does not exist and points at this doc. A
+  defect row references screenshots and `{DEFECTS_ROOT}/evidence` is not a directory.
+  Put the files there (the `mv` above, when `DEFECTS_ROOT` is the data dir).
+- The error says none of the referenced evidence files were found there and points
+  at this doc. The directory exists, but none of the stored paths is a regular file
+  inside it. Look for a nested `evidence/evidence` left by `mv` onto an existing
+  directory, or a stale `DEFECTS_ROOT` that still points at an empty umbrella
+  `evidence/` an older build recreated. An inventory with no evidence rows starts
+  normally. A refused start does not create the directory. Saving a screenshot does,
+  and a successful open of the store creates an empty `{DEFECTS_ROOT}/evidence` as well.

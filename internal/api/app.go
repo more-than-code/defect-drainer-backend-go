@@ -3,6 +3,7 @@ package api
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -56,6 +57,11 @@ func Build(opts Options) (*App, error) {
 	}
 	sqlDB, err := db.Open(roots.DataRoot)
 	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	if err := evidenceDirRequired(sqlDB, roots.DefectsRoot); err != nil {
+		sqlDB.Close()
 		lock.Close()
 		return nil, err
 	}
@@ -293,6 +299,79 @@ func (a *App) getEvidence(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", typ)
 	http.ServeFile(w, r, abs)
+}
+
+// evidenceDirRequired refuses to start when a defect row references evidence
+// files and those files are not in {DEFECTS_ROOT}/evidence. It does not create
+// anything. A directory with none of the referenced files (empty, or nested
+// one level too deep) is not enough.
+func evidenceDirRequired(sqlDB *sql.DB, defectsRoot string) error {
+	var n int
+	err := sqlDB.QueryRow(`
+		SELECT COUNT(*) FROM defects
+		WHERE json_array_length(evidence_json) > 0
+		   OR json_array_length(fix_evidence_json) > 0
+	`).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	dir := paths.EvidenceDir(defectsRoot)
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		return fmt.Errorf("evidence directory %s does not exist, but defects reference evidence files; see docs/operating.md", dir)
+	}
+	rows, err := sqlDB.Query(`
+		SELECT value FROM (
+			SELECT value FROM defects, json_each(evidence_json)
+			UNION ALL
+			SELECT value FROM defects, json_each(fix_evidence_json)
+		) LIMIT 50
+	`)
+	if err != nil {
+		return err
+	}
+	var rels []string
+	for rows.Next() {
+		var rel string
+		if err := rows.Scan(&rel); err != nil {
+			rows.Close()
+			return err
+		}
+		rels = append(rels, rel)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, rel := range rels {
+		if referencedEvidenceFile(defectsRoot, rel) {
+			return nil
+		}
+	}
+	return fmt.Errorf("evidence directory %s exists, but none of the referenced evidence files were found there; see docs/operating.md", dir)
+}
+
+// referencedEvidenceFile reports whether rel is a regular file under
+// {DEFECTS_ROOT}/evidence. Confinement matches inventoryEvidencePaths: clean
+// the joined path and reject anything that escapes that directory. The path
+// is not passed through EvalSymlinks.
+func referencedEvidenceFile(defectsRoot, rel string) bool {
+	if rel == "" || strings.ContainsAny(rel, "\x00\n\r`") {
+		return false
+	}
+	norm := strings.TrimLeft(strings.ReplaceAll(rel, "\\", "/"), "/")
+	cleanRoot := filepath.Clean(paths.EvidenceDir(defectsRoot))
+	cleanJoin := filepath.Clean(filepath.Join(defectsRoot, filepath.FromSlash(norm)))
+	r, err := filepath.Rel(cleanRoot, cleanJoin)
+	if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+		return false
+	}
+	st, err := os.Stat(cleanJoin)
+	return err == nil && st.Mode().IsRegular()
 }
 
 // migrateFilesystemIfNeeded is a no-op until tables are empty and legacy FS exists.
