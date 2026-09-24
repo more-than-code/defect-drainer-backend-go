@@ -35,19 +35,20 @@ type RunProgress struct {
 
 // RunStep is one snapshotted or exploratory step on a run.
 type RunStep struct {
-	Key         string   `json:"key"`
-	Position    int      `json:"position"`
-	Section     string   `json:"section"`
-	Action      string   `json:"action"`
-	Expected    string   `json:"expected"`
-	Exploratory bool     `json:"exploratory"`
-	Status      string   `json:"status"`
-	Actual      string   `json:"actual"`
-	Evidence    []string `json:"evidence"`
-	DefectID    *string  `json:"defect_id"`
-	Review      string   `json:"review"`
-	ReviewNote  string   `json:"review_note"`
-	UpdatedAt   string   `json:"updated_at"`
+	Key          string   `json:"key"`
+	Position     int      `json:"position"`
+	Section      string   `json:"section"`
+	Action       string   `json:"action"`
+	Expected     string   `json:"expected"`
+	Exploratory  bool     `json:"exploratory"`
+	Status       string   `json:"status"`
+	Actual       string   `json:"actual"`
+	Evidence     []string `json:"evidence"`
+	DefectID     *string  `json:"defect_id"`
+	DefectStatus *string  `json:"defect_status"`
+	Review       string   `json:"review"`
+	ReviewNote   string   `json:"review_note"`
+	UpdatedAt    string   `json:"updated_at"`
 }
 
 // TestRun is the run JSON object. List responses omit Steps and keep Progress.
@@ -240,8 +241,11 @@ func scanRun(sc interface{ Scan(...any) error }) (TestRun, error) {
 }
 
 func loadRunSteps(q rower, runID string) ([]RunStep, error) {
-	rows, err := q.Query(`SELECT step_key, position, section, action, expected, exploratory, status, actual, evidence_json, defect_id, review, review_note, updated_at
-		FROM test_step_results WHERE run_id = ? ORDER BY position ASC, step_key ASC`, runID)
+	rows, err := q.Query(`SELECT s.step_key, s.position, s.section, s.action, s.expected, s.exploratory,
+		s.status, s.actual, s.evidence_json, s.defect_id, d.status, s.review, s.review_note, s.updated_at
+		FROM test_step_results s
+		LEFT JOIN defects d ON d.id = s.defect_id
+		WHERE s.run_id = ? ORDER BY s.position ASC, s.step_key ASC`, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -251,8 +255,8 @@ func loadRunSteps(q rower, runID string) ([]RunStep, error) {
 		var s RunStep
 		var expl int
 		var evJSON string
-		var defect sql.NullString
-		if err := rows.Scan(&s.Key, &s.Position, &s.Section, &s.Action, &s.Expected, &expl, &s.Status, &s.Actual, &evJSON, &defect, &s.Review, &s.ReviewNote, &s.UpdatedAt); err != nil {
+		var defect, defectStatus sql.NullString
+		if err := rows.Scan(&s.Key, &s.Position, &s.Section, &s.Action, &s.Expected, &expl, &s.Status, &s.Actual, &evJSON, &defect, &defectStatus, &s.Review, &s.ReviewNote, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		s.Exploratory = expl != 0
@@ -261,6 +265,10 @@ func loadRunSteps(q rower, runID string) ([]RunStep, error) {
 			s.Evidence = []string{}
 		}
 		s.DefectID = nullStringPtr(defect)
+		if defectStatus.Valid && defectStatus.String != "" {
+			st := defectStatus.String
+			s.DefectStatus = &st
+		}
 		out = append(out, s)
 	}
 	return out, rows.Err()

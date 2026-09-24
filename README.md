@@ -106,15 +106,17 @@ Step screenshots live at `{DEFECTS_ROOT}/evidence/<TRUN-id>/s-<stepKey>-NN.ext` 
 | `GET` | `/api/test-plans?app_id=&include_archived=1` | Newest `updated_at` first. Archived plans are omitted unless `include_archived=1`. List rows include `step_count` and omit `steps`. |
 | `POST` | `/api/test-plans` | Upsert on `(app_id, key)`. **201** `{plan, created:true, changed:true}` when new. **200** `{plan, created:false, changed}` when the key already exists. |
 | `GET` | `/api/test-plans/{id}` | Plan and steps. |
+| `GET` | `/api/test-plans/{id}/grid?runs=N` | Current steps against the last N **reviewed** runs of the plan, newest `started_at` first. `N` defaults to 10 and must be 1..50. |
 | `PATCH` | `/api/test-plans/{id}` | Any of `title`, `purpose`, `env`, `steps` (full replace), `archived`. |
 | `DELETE` | `/api/test-plans/{id}` | **200** `{archived:true}` when a run still references it, otherwise `{deleted:true}`. |
 | `GET` | `/api/test-runs?app_id=&plan_id=` | Newest `created_at` first. List rows keep `progress` and omit `steps`. |
 | `POST` | `/api/test-runs` | Body includes `execute: "manual"`. `execute=agent` is **400** `execute=agent is not available yet`. `executor` is `operator` (default) or `agent-session`; `executor=dd-job` is **400** `executor=dd-job is not available yet`. Optional `plan_id` must belong to the app and must not be archived. Optional `account_label` and `refs`. Status starts `in_progress`. |
-| `GET` | `/api/test-runs/{id}` | Run and steps. |
+| `GET` | `/api/test-runs/{id}` | Run and steps. Each step includes `defect_id` and `defect_status`. |
 | `DELETE` | `/api/test-runs/{id}?evidence=1` | Deletes the run. `evidence=1` also removes that run's evidence directory. |
 | `POST` | `/api/test-runs/{id}/steps` | Appends an exploratory step. **409** unless the run is `in_progress`. **201** `{run}`. |
 | `PATCH` | `/api/test-runs/{id}/steps/{key}` | `status` and/or `actual`. `unverified` is **400**. **409** unless `in_progress`. |
 | `POST` | `/api/test-runs/{id}/steps/{key}/evidence` | Multipart screenshots, same limits as fix evidence. **409** unless `in_progress`. |
+| `POST` | `/api/test-runs/{id}/steps/{key}/file-defect` | Body `{title?, severity?, repos?, reporter?, note?}`. Files one defect from a `fail` or `blocked` step and copies that step's screenshots onto it. **201** `{defect, run}`. **400** unless the step is `fail` or `blocked`. **409** when the run is `abandoned`, or the step already has a defect (`step already has defect <DEF-id>`). |
 | `POST` | `/api/test-runs/{id}/finish` | `in_progress` → `awaiting_review`. A `pass` step with no evidence becomes `unverified`. Pending steps stay pending. Other states are **409**. |
 | `POST` | `/api/test-runs/{id}/abandon` | `in_progress` or `awaiting_review` → `abandoned`. Otherwise **409**. |
 | `POST` | `/api/test-runs/{id}/review` | Only from `awaiting_review` (**409** otherwise). `reviewer` is required. Each listed step is `accepted` or `disputed`. An unknown key or a `pending` step is **400**. Accepting an `unverified` step leaves its status `unverified`. |
@@ -122,7 +124,7 @@ Step screenshots live at `{DEFECTS_ROOT}/evidence/<TRUN-id>/s-<stepKey>-NN.ext` 
 
 App Settings accepts `test_accounts`: `[{label, username, environment, secret_ref}]`, returned on every app as an array. Any other key is **400** with `test_accounts only accept label, username, environment, secret_ref; passwords are never stored`. `label` is required and unique per app, case-insensitively. `secret_ref` is free text up to 200 characters; a value that starts with `env:` must match `env:` plus an uppercase environment-variable name (`^env:[A-Z_][A-Z0-9_]*$`). On run create, `account_label` copies the matching account into `env.account`. Passwords are never stored.
 
-`job_id` and per-step `defect_id` are present and null. Title is at most 200 characters. Purpose, action, expected, actual, and notes are at most 4000. `created_by`, `executed_by`, and `reviewer` are at most 120. `env` is a JSON object of at most 8 KiB. Filing a defect from a failed step, and agent-executed test jobs, are not in this API.
+`job_id` is present and null. Per-step `defect_id` is null until a defect is filed, and `defect_status` is that defect's current status, or null when there is no link or the defect was deleted. Title is at most 200 characters. Purpose, action, expected, actual, and notes are at most 4000. `created_by`, `executed_by`, and `reviewer` are at most 120. `env` is a JSON object of at most 8 KiB. A filed defect has `source` `test-run` and `related` `["<TRUN-id>/steps/<step_key>"]`. `needs_retest` is true for a plan step when a linked defect is `resolved` and no reviewed run of that plan, with `started_at` after the defect's `updated_at`, has accepted that step as `pass` or `unverified`. Agent-executed test jobs are not in this API.
 
 ## What stays on the worker host
 

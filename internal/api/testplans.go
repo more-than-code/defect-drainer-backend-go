@@ -382,6 +382,43 @@ func (a *App) reviewTestRun(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"run": run})
 }
 
+func (a *App) fileTestRunStepDefect(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeObject(w, r)
+	if !ok {
+		return
+	}
+	in := store.FileDefectInput{
+		Title: asString(body["title"]), Severity: asString(body["severity"]),
+		Reporter: asString(body["reporter"]), Note: asString(body["note"]),
+	}
+	if raw, exists := body["repos"]; exists && raw != nil {
+		in.HasRepos = true
+		arr, ok := raw.([]any)
+		if !ok {
+			httpx.WriteError(w, http.StatusBadRequest, "repos must be an array")
+			return
+		}
+		for _, item := range arr {
+			in.Repos = append(in.Repos, asString(item))
+		}
+	}
+	def, run, err := store.FileRunStepDefect(a.Store, r.PathValue("id"), r.PathValue("key"), in)
+	if err != nil {
+		writeOpErr(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"defect": def, "run": run})
+}
+
+func (a *App) getTestPlanGrid(w http.ResponseWriter, r *http.Request) {
+	grid, err := store.PlanGrid(a.DB, r.PathValue("id"), r.URL.Query().Get("runs"))
+	if err != nil {
+		writeOpErr(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"grid": grid})
+}
+
 func (a *App) saveTestRunAsPlan(w http.ResponseWriter, r *http.Request) {
 	body, ok := decodeObject(w, r)
 	if !ok {

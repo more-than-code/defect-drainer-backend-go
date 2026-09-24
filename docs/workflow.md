@@ -186,7 +186,7 @@ Ways to **enter** the workflow — same inventory, same schema:
 |---------|------|
 | **Console** | Day-to-day report, triage, jobs, evidence |
 | **HTTP API** | Scripts and future SDKs (`/api/intake`, defects, batches) |
-| **Test plans / runs** | HTTP API (`/api/test-plans`, `/api/test-runs`): reusable steps and manual runs that snapshot them. Filing a defect from a failed step, and agent-executed test jobs, are not built yet |
+| **Test plans / runs** | HTTP API (`/api/test-plans`, `/api/test-runs`): reusable steps and manual runs that snapshot them. Filing a defect from a failed or blocked step closes into the normal defect loop; resolving that defect marks the step for retest until a later reviewed run accepts it. Agent-executed test jobs are not built yet |
 | **Coding agent** | May write defects/evidence in-repo schema when asked; still uses the same inventory |
 
 ---
