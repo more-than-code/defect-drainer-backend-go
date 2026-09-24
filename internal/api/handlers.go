@@ -595,7 +595,21 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 			rec = *b2
 		}
 	}
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"batch": rec, "job": job})
+	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"batch": rec, "job": a.batchJobView(job)})
+}
+
+// batchJobView is the only batch job an HTTP body may carry. Action methods
+// return GetJob clones, which skip fillHarvests; the console stores that body
+// as the open job. resumable, rerunnable and simQueue come along with the
+// sanitised harvests.
+func (a *App) batchJobView(j *jobs.Job) *jobs.Job {
+	if j == nil {
+		return nil
+	}
+	if view := a.Batches.GetJobView(j.ID); view != nil {
+		return view
+	}
+	return j
 }
 
 // worktreeRequests is the local checkout plus the base that Settings saved.
@@ -756,7 +770,7 @@ func (a *App) stopBatchJob(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, code, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": a.batchJobView(j)})
 }
 
 func (a *App) rerunBatchJob(w http.ResponseWriter, r *http.Request) {
@@ -787,7 +801,7 @@ func (a *App) restartBatchJob(w http.ResponseWriter, r *http.Request, resume boo
 		httpx.WriteError(w, code, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": a.batchJobView(j)})
 }
 
 func (a *App) shipPreview(w http.ResponseWriter, r *http.Request) {
@@ -828,6 +842,7 @@ func (a *App) createPRs(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, code, err.Error())
 		return
 	}
+	j = a.batchJobView(j)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j, "prs": j.PRs})
 }
 
@@ -841,6 +856,7 @@ func (a *App) refreshPRs(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, code, err.Error())
 		return
 	}
+	j = a.batchJobView(j)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j, "prs": j.PRs})
 }
 

@@ -51,6 +51,7 @@ type Job struct {
 	AgentRun     *AgentRun             `json:"agentRun,omitempty"`
 	DiffBase     map[string]string     `json:"diffBase,omitempty"`     // worktree HEADs at first spawn; restarts measure hygiene from here
 	RunStartedAt string                `json:"runStartedAt,omitempty"` // latest Re-run/Resume; harvest imports only images newer than this
+	Harvests     []HarvestRun          `json:"harvests,omitempty"`     // one entry per harvest, oldest first; last 20 kept
 	QueuedAt     string                `json:"queuedAt,omitempty"`     // when this job parked for the simulator lease (RFC3339Nano, UTC)
 	QueuedMode   string                `json:"queuedMode,omitempty"`   // fresh, rerun, or resume — replayed when the lease is handed over
 	SimQueue     *SimQueue             `json:"simQueue,omitempty"`     // computed on API reads (GetJobView/ListView), never persisted
@@ -73,7 +74,7 @@ var jobOwnedJSON = map[string]bool{
 	"error": true, "handoffPath": true, "createdAt": true, "updatedAt": true,
 	"comment": true, "reporter": true, "prs": true, "worktrees": true,
 	"verification": true, "baseline": true, "diffHygiene": true,
-	"agentRun": true, "diffBase": true, "runStartedAt": true, "queuedAt": true, "queuedMode": true, "simQueue": true, "resumable": true, "rerunnable": true,
+	"agentRun": true, "diffBase": true, "runStartedAt": true, "harvests": true, "queuedAt": true, "queuedMode": true, "simQueue": true, "resumable": true, "rerunnable": true,
 	"log": true, "source": true, "defectPath": true,
 	"severity": true, "client": true, "surface": true,
 }
@@ -150,6 +151,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		AgentRun     *AgentRun             `json:"agentRun,omitempty"`
 		DiffBase     map[string]string     `json:"diffBase,omitempty"`
 		RunStartedAt string                `json:"runStartedAt,omitempty"`
+		Harvests     []HarvestRun          `json:"harvests,omitempty"`
 		QueuedAt     string                `json:"queuedAt,omitempty"`
 		QueuedMode   string                `json:"queuedMode,omitempty"`
 		SimQueue     *SimQueue             `json:"simQueue,omitempty"`
@@ -170,6 +172,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees,
 		Verification: j.Verification, Baseline: j.Baseline, DiffHygiene: j.DiffHygiene,
 		AgentRun: j.AgentRun, DiffBase: j.DiffBase, RunStartedAt: j.RunStartedAt,
+		Harvests: j.Harvests,
 		QueuedAt: j.QueuedAt, QueuedMode: j.QueuedMode, SimQueue: j.SimQueue,
 		Resumable: j.Resumable, Rerunnable: j.Rerunnable,
 		Log: j.Log, Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
@@ -424,6 +427,12 @@ func cloneJob(j *Job) *Job {
 	if j.SimQueue != nil {
 		s := *j.SimQueue
 		c.SimQueue = &s
+	}
+	if j.Harvests != nil {
+		c.Harvests = make([]HarvestRun, len(j.Harvests))
+		for i := range j.Harvests {
+			c.Harvests[i] = cloneHarvestRun(j.Harvests[i])
+		}
 	}
 	if j.Extra != nil {
 		c.Extra = cloneMap(j.Extra)
@@ -812,8 +821,10 @@ func (b *BatchRunner) hydrate() {
 			continue
 		}
 		// simQueue is computed on read. Drop a copy an older write left behind
-		// so the next persist does not store it.
+		// so the next persist does not store it. Harvest caps are structural
+		// only: no evidence-dir reads while hydrating.
 		j.SimQueue = nil
+		j.Harvests = capHarvestRuns(j.Harvests, nil)
 		if j.Status == "running" {
 			j.Status = "failed"
 			j.Error = "interrupted by backend restart"
@@ -1429,6 +1440,7 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 	resolved := 0
 	cutoff := harvestCutoff(job)
 	imgCutoff := importCutoff(job)
+	recorded := []HarvestDefect{}
 
 	for _, defectID := range job.DefectIDs {
 		if !store.IsSafeID(defectID) {
@@ -1476,25 +1488,35 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 		}
 		if len(files) == 0 && note == "" {
 			b.appendLog(job, "harvest "+defectID+": no fix-evidence/ or fix-notes/ — left open", "warn", "DefectDrainer")
+			recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestNoEvidence})
 			continue
 		}
 		cur, err := b.store.Get(defectID)
 		if err != nil || cur == nil {
+			reason := "defect not found"
+			if err != nil {
+				reason = err.Error()
+			}
+			recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestError, Reason: reason})
 			continue
 		}
+		var saved []string
 		if len(files) > 0 {
 			added, err := b.store.SaveEvidence(defectID, files, "fix")
 			if err != nil {
 				b.appendLog(job, "harvest "+defectID+" failed: "+err.Error(), "error", "DefectDrainer")
+				recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestError, Reason: err.Error()})
 				continue
 			}
+			saved = added
 			cur.FixEvidence = append(cur.FixEvidence, added...)
-			saved, err := b.store.Write(*cur)
+			written, err := b.store.Write(*cur)
 			if err != nil {
 				b.appendLog(job, "harvest "+defectID+" failed: "+err.Error(), "error", "DefectDrainer")
+				recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestError, Reason: err.Error(), Images: saved})
 				continue
 			}
-			cur = &saved
+			cur = &written
 			imported += len(files)
 			b.appendLog(job, fmt.Sprintf("harvest %s: %d fix image(s) → evidence/", defectID, len(files)), "info", "DefectDrainer")
 		}
@@ -1503,7 +1525,16 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 		// was already there before it started (see judgeVerification).
 		verdict := judgeVerification(verification, job.Baseline)
 		if verification != nil && verification.Ran && !verdict.Ok {
-			b.appendLog(job, "harvest "+defectID+": NOT resolved — "+summarizeVerdict(verdict), "warn", "DefectDrainer")
+			why := summarizeVerdict(verdict)
+			b.appendLog(job, "harvest "+defectID+": NOT resolved — "+why, "warn", "DefectDrainer")
+			if len(files) == 0 {
+				recorded = append(recorded, HarvestDefect{
+					DefectID: defectID, Outcome: harvestNotesOnly,
+					Reason: "verification: " + why + "; note not saved",
+				})
+			} else {
+				recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestRegression, Reason: why, Images: saved})
+			}
 			continue
 		}
 
@@ -1525,20 +1556,29 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 			}
 			if _, err := b.store.Resolve(defectID, res, cur.FixEvidence, false); err != nil {
 				b.appendLog(job, "harvest "+defectID+" failed: "+err.Error(), "error", "DefectDrainer")
+				recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestError, Reason: err.Error(), Images: saved})
 				continue
 			}
 			resolved++
 			b.appendLog(job, "harvest "+defectID+": resolved with fix_evidence", "info", "DefectDrainer")
+			recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestResolved, Images: saved})
 		} else if note != "" {
 			_, _ = b.store.Update(defectID, store.DefectRecord{Resolution: note}, map[string]bool{"resolution": true})
 			if len(files) > 0 {
 				b.appendLog(job, "harvest "+defectID+": fix image(s) imported but NOT resolved — "+resolveDenyReason, "warn", "DefectDrainer")
+				recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestNotResolved, Reason: resolveDenyReason, Images: saved})
 			} else {
 				b.appendLog(job, "harvest "+defectID+": notes only (no images) — still needs screenshots", "warn", "DefectDrainer")
+				recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestNotesOnly})
 			}
+		} else if len(files) > 0 {
+			// No note, so the warn line above is not emitted. The images were
+			// still imported and the run may not resolve.
+			recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestNotResolved, Reason: resolveDenyReason, Images: saved})
 		}
 	}
 	b.appendLog(job, fmt.Sprintf("harvest done: %d image(s), %d/%d resolved", imported, resolved, len(job.DefectIDs)), "info", "DefectDrainer")
+	b.recordHarvest(job.ID, recorded)
 }
 
 // SyncBatchAndDefects aligns batch + defects with the job outcome.

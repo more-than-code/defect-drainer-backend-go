@@ -139,6 +139,7 @@ func (b *BatchRunner) GetJobView(id string) *Job {
 	if c != nil {
 		b.fillRestartChecks(c, b.isLive(id))
 		b.fillSimQueue(c)
+		b.fillHarvests(c)
 	}
 	return c
 }
@@ -150,6 +151,8 @@ func (b *BatchRunner) ListView() []*Job {
 	for _, c := range out {
 		b.fillRestartChecks(c, b.isLive(c.ID))
 		b.fillSimQueue(c)
+		// The batch list is every job. Harvest history is a job-detail payload.
+		c.Harvests = nil
 	}
 	return out
 }

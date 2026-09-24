@@ -66,6 +66,8 @@ A defect resolves only when **this run** imported a screenshot and verification 
 regression against the baseline. After a `completed` job that did not resolve it, the defect
 stays `in_progress` even though nothing is running: Resume, or start a fresh job.
 
+Each harvest appends a run to `job.harvests` (oldest first, the last 20 kept; Resume and Re-run do not clear them). Each defect is one entry: `resolved` (this run's screenshot was accepted), `regression` (a screenshot was imported but verification failed — read the reason, fix what it reports, then Resume or Re-run), `not_resolved` (a screenshot was imported but this run was not allowed to resolve, because the agent failed, was cancelled, or stopped short of its artifacts — Resume or Re-run), `notes_only` (a note and no screenshot; if verification blocked saving the note, the reason says so), `no_evidence` (nothing was imported — the defect stays open, so Resume or add a screenshot), or `error` (the defect could not be read, or saving a screenshot or resolving failed — the reason is the error text, and any screenshot already saved is still listed). The job drawer's Evidence tab shows each run's screenshots beside the report's. Stop, Resume, Re-run, Create PR, Refresh PR, and creating a batch return that same sanitised list (and `resumable` / `rerunnable` / `simQueue`); the batch list still leaves `harvests` off.
+
 ## Job actions
 
 The server decides whether Resume and Re-run are allowed. When they are not, the button is
