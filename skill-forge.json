@@ -10,7 +10,7 @@
       "umbrella-workspace": "^0.9.1",
       "api-contracts": "^0.1.0",
       "podman-utilization": "^0.1.0",
-      "grok-build-harness": "^0.4.0",
+      "grok-build-harness": "^0.5.0",
       "external-worker-delegation": "^0.8.2",
       "llm-integration": "^0.1.0",
       "audit-trail": "^0.1.0",

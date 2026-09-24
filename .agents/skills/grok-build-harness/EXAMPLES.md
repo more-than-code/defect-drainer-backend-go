@@ -37,7 +37,7 @@ exhaustion, not the default.
 ```bash
 cd /path/to/work || exit 1
 grok --prompt-file BRIEF.md --no-subagents \
-  --sandbox workspace --permission-mode auto --max-turns 400 \
+  --sandbox workspace --always-approve --max-turns 400 \
   --output-format streaming-json | tee run.jsonl
 ```
 
@@ -53,7 +53,7 @@ the media checks before you consider yourself done, and write NOTES.md.'
 
 for i in $(seq 1 30); do
   echo "########## ITERATION $i $(date +%H:%M:%S) ##########"
-  grok -c -p "$PROMPT" --sandbox workspace --permission-mode auto --max-turns 400 \
+  grok -c -p "$PROMPT" --sandbox workspace --always-approve --max-turns 400 \
     --output-format streaming-json | tee -a run.jsonl
   # Completion markers = artifacts on disk, not the model's word
   if [ -f NOTES.md ] && ls static/video/*.mp4 >/dev/null 2>&1; then
@@ -133,7 +133,7 @@ grok usage <sessionId>     # costUsdTicks = USD x 10^10
 The loop's `-c` needs an existing session for that cwd. Either seed one:
 
 ```bash
-grok -p "Read BRIEF.md and begin executing it." --sandbox workspace --permission-mode auto
+grok -p "Read BRIEF.md and begin executing it." --sandbox workspace --always-approve
 ```
 
 …then run the loop, or make iteration 1 use the seed prompt and later ones `-c`.
