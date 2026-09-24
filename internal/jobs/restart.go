@@ -131,21 +131,25 @@ func (b *BatchRunner) fillRestartChecks(c *Job, live bool) {
 	c.Resumable = resumeCheck(c, f)
 }
 
-// GetJobView is GetJob plus Resumable/Rerunnable, for API reads only. The
-// driver loop calls GetJob constantly and must not pay for the disk probes.
+// GetJobView is GetJob plus Resumable/Rerunnable and, for a queued job, the
+// simulator-lease wait spot. For API reads only. The driver loop calls GetJob
+// constantly and must not pay for the disk probes.
 func (b *BatchRunner) GetJobView(id string) *Job {
 	c := b.GetJob(id)
 	if c != nil {
 		b.fillRestartChecks(c, b.isLive(id))
+		b.fillSimQueue(c)
 	}
 	return c
 }
 
-// ListView is List plus Resumable/Rerunnable, for API reads only.
+// ListView is List plus Resumable/Rerunnable and the simulator-lease wait
+// spot, for API reads only.
 func (b *BatchRunner) ListView() []*Job {
 	out := b.List()
 	for _, c := range out {
 		b.fillRestartChecks(c, b.isLive(c.ID))
+		b.fillSimQueue(c)
 	}
 	return out
 }

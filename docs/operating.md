@@ -40,6 +40,9 @@ On **Defects**, check one defect → **Start fix**, or several → **Start batch
 - Otherwise DD sets the defects to `in_progress`, creates one worktree per repo on a new
   branch `defect-drainer/<BATCH-id>`, writes the brief, runs the verify commands as the
   **baseline**, and starts the coding agent. The job opens on **Jobs**.
+- When the app allows Simulator writes, jobs on this machine share one lease for the booted
+  simulator. The next job waits as `queued` and starts on its own once the current job's agent
+  loop ends.
 - **Never have two live jobs on one defect.** Nothing stops it; two agents would fix the same
   defect and the first harvest wins. Stop or delete the old job first.
 
@@ -48,6 +51,7 @@ On **Defects**, check one defect → **Start fix**, or several → **Start batch
 | Status | `agentRun.stoppedBy` / error | Meaning | Next |
 |---|---|---|---|
 | `running` | — | Agent loop, verify or harvest in progress | Wait, or **Stop** |
+| `queued` | — | Waiting for the simulator lease. Another job whose app allows Simulator writes is in its agent loop; this job has not started | Wait, or **Stop** (it never spawns). It starts on its own when the lease frees |
 | `completed` | `artifacts` | The agent delivered NOTES.md, the fix notes and a screenshot per defect; verify and harvest ran | Review evidence; **Create PR** / **Merge** |
 | `completed` | `iterations` / `wall` (`missing` listed) | The budget ran out before the artifacts existed (8 attempts / 45 min by default) | **Resume** with a fresh budget |
 | `failed` | `Grok exited code=…` | The agent crashed (a non-zero exit that was not a turn cap). Evidence was imported, nothing resolved | **Resume**, or **Re-run** if it went wrong |
@@ -144,6 +148,10 @@ Agent processes are children of `serve`, but they **outlive it**: stopping `serv
 reliably stop them, and a restarted `serve` does not know they exist. So the new server's
 "is this job live?" check cannot see them, and Resume would start a second agent beside an
 orphan. Always restart cleanly, or clean up after.
+
+A job left `queued` — waiting on the simulator lease, with no agent of its own — stays
+`queued` across a restart and starts on its own, oldest first. A job that was `running` still
+comes back `failed` / `interrupted by backend restart`.
 
 ### Clean restart
 1. Check for live jobs:

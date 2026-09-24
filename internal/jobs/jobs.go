@@ -51,6 +51,9 @@ type Job struct {
 	AgentRun     *AgentRun             `json:"agentRun,omitempty"`
 	DiffBase     map[string]string     `json:"diffBase,omitempty"`     // worktree HEADs at first spawn; restarts measure hygiene from here
 	RunStartedAt string                `json:"runStartedAt,omitempty"` // latest Re-run/Resume; harvest imports only images newer than this
+	QueuedAt     string                `json:"queuedAt,omitempty"`     // when this job parked for the simulator lease (RFC3339Nano, UTC)
+	QueuedMode   string                `json:"queuedMode,omitempty"`   // fresh, rerun, or resume — replayed when the lease is handed over
+	SimQueue     *SimQueue             `json:"simQueue,omitempty"`     // computed on API reads (GetJobView/ListView), never persisted
 	Log          []string              `json:"log,omitempty"`
 	Source       string                `json:"source,omitempty"`
 	DefectPath   string                `json:"defectPath,omitempty"`
@@ -70,7 +73,7 @@ var jobOwnedJSON = map[string]bool{
 	"error": true, "handoffPath": true, "createdAt": true, "updatedAt": true,
 	"comment": true, "reporter": true, "prs": true, "worktrees": true,
 	"verification": true, "baseline": true, "diffHygiene": true,
-	"agentRun": true, "diffBase": true, "runStartedAt": true, "resumable": true, "rerunnable": true,
+	"agentRun": true, "diffBase": true, "runStartedAt": true, "queuedAt": true, "queuedMode": true, "simQueue": true, "resumable": true, "rerunnable": true,
 	"log": true, "source": true, "defectPath": true,
 	"severity": true, "client": true, "surface": true,
 }
@@ -147,6 +150,9 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		AgentRun     *AgentRun             `json:"agentRun,omitempty"`
 		DiffBase     map[string]string     `json:"diffBase,omitempty"`
 		RunStartedAt string                `json:"runStartedAt,omitempty"`
+		QueuedAt     string                `json:"queuedAt,omitempty"`
+		QueuedMode   string                `json:"queuedMode,omitempty"`
+		SimQueue     *SimQueue             `json:"simQueue,omitempty"`
 		Log          []string              `json:"log,omitempty"`
 		Source       string                `json:"source,omitempty"`
 		DefectPath   string                `json:"defectPath,omitempty"`
@@ -164,6 +170,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees,
 		Verification: j.Verification, Baseline: j.Baseline, DiffHygiene: j.DiffHygiene,
 		AgentRun: j.AgentRun, DiffBase: j.DiffBase, RunStartedAt: j.RunStartedAt,
+		QueuedAt: j.QueuedAt, QueuedMode: j.QueuedMode, SimQueue: j.SimQueue,
 		Resumable: j.Resumable, Rerunnable: j.Rerunnable,
 		Log: j.Log, Source: j.Source, DefectPath: j.DefectPath, Severity: j.Severity,
 		Client: j.Client, Surface: j.Surface,
@@ -413,6 +420,10 @@ func cloneJob(j *Job) *Job {
 			d.Repos = append([]RepoDiffHygiene(nil), j.DiffHygiene.Repos...)
 		}
 		c.DiffHygiene = &d
+	}
+	if j.SimQueue != nil {
+		s := *j.SimQueue
+		c.SimQueue = &s
 	}
 	if j.Extra != nil {
 		c.Extra = cloneMap(j.Extra)
@@ -755,21 +766,30 @@ type BatchRunner struct {
 	// share the handoff with a goroutine that still writes the job and, on
 	// exit, cancels whatever verify context is current.
 	driving      map[string]bool
-	verifyCancel map[string]context.CancelFunc
+	verifyCancel map[string]*verifyCancelSlot
 	store        *store.Store
 	dataRoot     string
 	jobs         map[string]*Job
 	procs        map[string]*spawnedProc
+	// simHolder is the job that owns the one host simulator lease. simQueue
+	// is the FIFO of AllowSimulatorWrites jobs waiting for it. defectsRoot is
+	// the defects directory a handover passes to startSpawn; ResumeQueue and
+	// startSpawn set it. It is not read back from job.json.
+	simHolder   string
+	simQueue    []simWaiter
+	defectsRoot string
 }
 
-// NewBatchRunner hydrates batch-jobs; running/queued → failed + interrupted.
+// NewBatchRunner hydrates batch-jobs. A running job is failed as interrupted
+// (its agent died with the process). A queued job stays queued; call
+// ResumeQueue to start the oldest one.
 func NewBatchRunner(st *store.Store, dataRoot string) *BatchRunner {
 	b := &BatchRunner{
 		store: st, dataRoot: dataRoot,
 		jobs:         map[string]*Job{},
 		procs:        map[string]*spawnedProc{},
 		persist:      map[string]*sync.Mutex{},
-		verifyCancel: map[string]context.CancelFunc{},
+		verifyCancel: map[string]*verifyCancelSlot{},
 	}
 	_ = os.MkdirAll(paths.BatchJobsDir(dataRoot), 0o755)
 	b.hydrate()
@@ -782,6 +802,7 @@ func (b *BatchRunner) hydrate() {
 	if err != nil {
 		return
 	}
+	var queued []*Job
 	for _, e := range ents {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
@@ -790,14 +811,21 @@ func (b *BatchRunner) hydrate() {
 		if j == nil {
 			continue
 		}
-		if j.Status == "running" || j.Status == "queued" {
+		// simQueue is computed on read. Drop a copy an older write left behind
+		// so the next persist does not store it.
+		j.SimQueue = nil
+		if j.Status == "running" {
 			j.Status = "failed"
 			j.Error = "interrupted by backend restart"
 			j.Log = append(j.Log, "[warn] [DefectDrainer] marked failed on hydrate (Grok process no longer live)")
 			_ = writeJob(filepath.Join(root, e.Name()), j)
 		}
 		b.jobs[j.ID] = j
+		if j.Status == "queued" {
+			queued = append(queued, j)
+		}
 	}
+	b.rebuildSimQueue(queued)
 }
 
 func makeBatchID(now time.Time) string {
@@ -1024,6 +1052,7 @@ func (b *BatchRunner) DeleteJob(id string) ([]git.WorktreeDiscard, error) {
 		wts = append(wts, j.Worktrees...)
 		appID = j.AppID
 	}
+	b.dequeueSimLocked(id)
 	slot := b.procs[id]
 	var startDone, loopDone chan struct{}
 	if b.starting != nil {
@@ -1034,11 +1063,14 @@ func (b *BatchRunner) DeleteJob(id string) ([]git.WorktreeDiscard, error) {
 	}
 	delete(b.jobs, id)
 	delete(b.procs, id)
-	c := b.verifyCancel[id]
+	var cancel context.CancelFunc
+	if slot := b.verifyCancel[id]; slot != nil {
+		cancel = slot.cancel
+	}
 	delete(b.verifyCancel, id)
 	b.mu.Unlock()
-	if c != nil {
-		c()
+	if cancel != nil {
+		cancel()
 	}
 	if slot != nil && slot.cmd != nil && slot.cmd.Process != nil {
 		_ = slot.cmd.Process.Kill()
@@ -1117,22 +1149,50 @@ func (b *BatchRunner) trustedBases(appID string, wts []git.WorktreeBinding) []gi
 	return out
 }
 
-func (b *BatchRunner) setVerifyCancel(id string, cancel context.CancelFunc) {
+// verifyCancelSlot is one startSpawn invocation's verify context. token is
+// pointer identity: a queued call's defer must not cancel the dispatch that
+// has since replaced the slot. context.CancelFunc itself is not comparable.
+type verifyCancelSlot struct {
+	token  *int
+	cancel context.CancelFunc
+}
+
+func (b *BatchRunner) setVerifyCancel(id string, token *int, cancel context.CancelFunc) {
 	b.mu.Lock()
 	if b.verifyCancel == nil {
-		b.verifyCancel = map[string]context.CancelFunc{}
+		b.verifyCancel = map[string]*verifyCancelSlot{}
 	}
-	b.verifyCancel[id] = cancel
+	b.verifyCancel[id] = &verifyCancelSlot{token: token, cancel: cancel}
 	b.mu.Unlock()
 }
 
-func (b *BatchRunner) callVerifyCancel(id string) {
+// callVerifyCancel cancels and drops the slot only when token is still the
+// one installed. A newer invocation's context is left alone.
+func (b *BatchRunner) callVerifyCancel(id string, token *int) {
 	b.mu.Lock()
-	c := b.verifyCancel[id]
+	slot := b.verifyCancel[id]
+	if slot == nil || slot.token != token {
+		b.mu.Unlock()
+		return
+	}
 	delete(b.verifyCancel, id)
+	cancel := slot.cancel
 	b.mu.Unlock()
-	if c != nil {
-		c()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// dropOwnVerifyCancel cancels this invocation's context. If a dispatch has
+// already replaced the slot, the map entry stays; only our own func is cancelled.
+func (b *BatchRunner) dropOwnVerifyCancel(id string, token *int, cancel context.CancelFunc) {
+	b.mu.Lock()
+	if slot := b.verifyCancel[id]; slot != nil && slot.token == token {
+		delete(b.verifyCancel, id)
+	}
+	b.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -1636,6 +1696,12 @@ var (
 	harvestStartHook         func()
 	loopBeforeNextHook       func()
 	spawnExitHook            func()
+	// simLeaseQueuedHook runs after a job is queued and before that startSpawn
+	// returns, so a test can promote the waiter before the caller's defer.
+	simLeaseQueuedHook func()
+	// simLeaseBeforeResumeProbeHook runs before a dispatched Resume looks up
+	// its grok session.
+	simLeaseBeforeResumeProbeHook func()
 )
 
 func jobGoneOrCancelled(j *Job) bool {
@@ -1665,20 +1731,39 @@ func (b *BatchRunner) StartSpawn(jobID, defectsRoot string) error {
 // the agent's edits, so re-measuring would compare the agent against itself —
 // and add to the stored agentRun. resumeSession, when set, is the grok
 // session iteration 1 continues (-r).
+//
+// An app with AllowSimulatorWrites takes the one host simulator lease here.
+// If another job holds it, this job is persisted as queued and the call
+// returns nil. The lease moves on when the holder's agent loop ends, or
+// sooner when the holder never launches.
 func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resumeSession string) error {
+	// These returns are before the launch defer. A handover may already have
+	// named this job the holder; give the lease up if we are not going to run.
+	bail := func(err error) error {
+		b.mu.Lock()
+		held := b.simHolder == jobID
+		b.mu.Unlock()
+		if held {
+			b.releaseSimLease(jobID)
+		}
+		return err
+	}
 	b.mu.Lock()
+	if defectsRoot != "" {
+		b.defectsRoot = defectsRoot
+	}
 	j := b.jobs[jobID]
 	if j == nil {
 		b.mu.Unlock()
-		return fmt.Errorf("job not found: %s", jobID)
+		return bail(fmt.Errorf("job not found: %s", jobID))
 	}
 	if jobGoneOrCancelled(j) {
 		b.mu.Unlock()
-		return nil
+		return bail(nil)
 	}
 	if len(j.Worktrees) == 0 {
 		b.mu.Unlock()
-		return fmt.Errorf("refusing to spawn agent batch fix without worktrees")
+		return bail(fmt.Errorf("refusing to spawn agent batch fix without worktrees"))
 	}
 	wts := append([]git.WorktreeBinding(nil), j.Worktrees...)
 	handoff := filepath.Join(paths.BatchJobsDir(b.dataRoot), jobID)
@@ -1692,11 +1777,20 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	b.starting[jobID] = done
 	b.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
-	b.setVerifyCancel(jobID, cancel)
+	token := new(int)
+	b.setVerifyCancel(jobID, token, cancel)
 	launched := false
+	// queuedHere: this call parked the job. A handover may promote it before
+	// the defer runs; releasing or cancelling here would steal that dispatch.
+	queuedHere := false
 	defer func() {
 		if !launched {
-			b.callVerifyCancel(jobID)
+			if queuedHere {
+				b.dropOwnVerifyCancel(jobID, token, cancel)
+			} else {
+				b.callVerifyCancel(jobID, token)
+				b.releaseSimLease(jobID)
+			}
 		}
 		b.mu.Lock()
 		if b.starting[jobID] == done {
@@ -1720,7 +1814,14 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	}
 	b.mu.Unlock()
 
-	app, _ := store.GetApp(b.store.DB, appID)
+	if b.store == nil || b.store.DB == nil {
+		return fmt.Errorf("read app %s: store is not open", appID)
+	}
+	app, err := store.GetApp(b.store.DB, appID)
+	if err != nil {
+		// A failed read must not look like "flag clear" and skip the lease.
+		return fmt.Errorf("read app %s: %w", appID, err)
+	}
 	sandbox := "strict"
 	toolchainKind := "none"
 	simWrites := false
@@ -1742,6 +1843,16 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 		turnsNote = strconv.Itoa(maxTurns)
 	}
 	b.appendLog(&jobCopy, fmt.Sprintf("app %s grok_sandbox=%s agent_toolchain=%s agent_max_turns=%s", appID, sandbox, toolchainKind, turnsNote), "info", "DefectDrainer")
+
+	// One lease for the whole host, shared by every app that writes to the
+	// booted simulator. Apps without the flag never wait.
+	if simWrites && !b.holdOrQueueSim(jobID, mode, defectsRoot) {
+		queuedHere = true
+		if simLeaseQueuedHook != nil {
+			simLeaseQueuedHook()
+		}
+		return nil
+	}
 
 	spawnLog := func(line, level string) {
 		b.appendLog(&Job{ID: jobID}, line, level, "DefectDrainer")
@@ -1856,27 +1967,14 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 			OnMaxTurns: acc.maxTurnsReached,
 		})
 	}
-	cmd, flush, err := startIter(false, resumeSession)
-	if err != nil {
-		return err
-	}
-	// The wall clock starts here — at iter-1 Start, not at StartSpawn. Baseline
-	// is 20 min per command on its own clock and must not eat the agent budget.
-	loopStart := time.Now()
-	maxIters := parsePositiveInt(env.EnvDrainer("AGENT_MAX_ITERS"), defaultAgentMaxIters)
-	maxWall := time.Duration(parsePositiveInt(env.EnvDrainer("AGENT_MAX_WALL_SEC"), defaultAgentMaxWallSec)) * time.Second
-	if startSpawnAfterStartHook != nil {
-		startSpawnAfterStartHook()
-	}
+	// Running hits disk before the child exists. A kill after this rename
+	// hydrates as interrupted; a kill before it leaves queued and no process.
 	b.mu.Lock()
 	live := b.jobs[jobID]
 	if jobGoneOrCancelled(live) {
 		b.mu.Unlock()
-		abandonStartedAgent(cmd, flush)
 		return nil
 	}
-	proc := &spawnedProc{cmd: cmd}
-	b.procs[jobID] = proc
 	live.Status = "running"
 	live.Error = ""
 	if live.DiffBase == nil {
@@ -1890,7 +1988,38 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 		b.appendLogLocked(live, fmt.Sprintf("worktree %s → %s (%s)", w.Repo, w.WorktreeAbs, w.Branch), "info", "DefectDrainer")
 	}
 	b.mu.Unlock()
-	b.persistLive(jobID)
+	if err := b.persistLive(jobID); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	if jobGoneOrCancelled(b.jobs[jobID]) {
+		b.mu.Unlock()
+		return nil
+	}
+	b.mu.Unlock()
+
+	cmd, flush, err := startIter(false, resumeSession)
+	if err != nil {
+		return err
+	}
+	// The wall clock starts here — at iter-1 Start, not at StartSpawn. Baseline
+	// is 20 min per command on its own clock and must not eat the agent budget.
+	loopStart := time.Now()
+	maxIters := parsePositiveInt(env.EnvDrainer("AGENT_MAX_ITERS"), defaultAgentMaxIters)
+	maxWall := time.Duration(parsePositiveInt(env.EnvDrainer("AGENT_MAX_WALL_SEC"), defaultAgentMaxWallSec)) * time.Second
+	if startSpawnAfterStartHook != nil {
+		startSpawnAfterStartHook()
+	}
+	b.mu.Lock()
+	live = b.jobs[jobID]
+	if jobGoneOrCancelled(live) {
+		b.mu.Unlock()
+		abandonStartedAgent(cmd, flush)
+		return nil
+	}
+	proc := &spawnedProc{cmd: cmd}
+	b.procs[jobID] = proc
+	b.mu.Unlock()
 	launched = true
 	loopDone := make(chan struct{})
 	b.mu.Lock()
@@ -1919,13 +2048,16 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 				}
 				b.mu.Unlock()
 				close(loopDone)
+				// Verify and harvest stay on this goroutine. The next simulator
+				// job may start while they are still running.
+				b.releaseSimLease(jobID)
 			})
 		}
 		defer func() {
 			endLoop()
 			// Cancel before releasing driving: once it clears, a Restart may
 			// install the next run's cancel under the same id.
-			b.callVerifyCancel(jobID)
+			b.callVerifyCancel(jobID, token)
 			b.mu.Lock()
 			delete(b.driving, jobID)
 			b.mu.Unlock()
@@ -2097,6 +2229,9 @@ func (b *BatchRunner) Stop(jobID string) (*Job, error) {
 		b.mu.Unlock()
 		return nil, fmt.Errorf("cannot stop job in status %s (only running/queued)", j.Status)
 	}
+	// A queued job has no agent. Drop it before anyone can hand it the lease.
+	// A running holder keeps the lease until its loop ends.
+	b.dequeueSimLocked(jobID)
 	slot := b.procs[jobID]
 	j.Status = "cancelled"
 	j.Error = "stopped by operator"
@@ -2104,11 +2239,14 @@ func (b *BatchRunner) Stop(jobID string) (*Job, error) {
 	if slot == nil {
 		b.appendLogLocked(j, "no live process handle (may still be starting)", "warn", "DefectDrainer")
 	}
-	c := b.verifyCancel[jobID]
+	var cancel context.CancelFunc
+	if slot := b.verifyCancel[jobID]; slot != nil {
+		cancel = slot.cancel
+	}
 	delete(b.verifyCancel, jobID)
 	b.mu.Unlock()
-	if c != nil {
-		c()
+	if cancel != nil {
+		cancel()
 	}
 	b.persistLive(jobID)
 	if slot != nil && slot.cmd != nil && slot.cmd.Process != nil {

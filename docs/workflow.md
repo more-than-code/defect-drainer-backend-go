@@ -124,6 +124,7 @@ widened its own sandbox must not have its work resolved.
 | **Brief / handoff** | `BRIEF.md` (role, facts, decisions, deliverables, defects) + `PROCESS.md` (worker contract) + `SKILLS.md` (per-worktree skill and contract paths) under the job handoff dir |
 | **Observability** | Job log stream (harness lines vs agent lines) |
 | **Stop / resume / re-run** | Console job actions; the server decides which restarts a job allows and says why not |
+| **Simulator lease** | One host-wide lease for every app with Simulator writes. A job that needs the booted simulator waits `queued` until the holder's agent loop ends |
 | **Deterministic ops** | Create PR or local Merge (from the repo's base source), refresh that state, resolve — host tools, not “hope the model did it” |
 
 The **coding agent is a worker inside the harness**, not the product. The harness owns inventory, gates (fix-backed-by-evidence), and git/PR actions.

@@ -80,6 +80,9 @@ func Build(opts Options) (*App, error) {
 		Jobs:    jobs.NewRunner(st, roots.DataRoot),
 		Batches: jobs.NewBatchRunner(st, roots.DataRoot),
 	}
+	// Queued simulator jobs survived the restart. Start the oldest now that
+	// the runner exists; the rest follow as each agent's loop ends.
+	a.Batches.ResumeQueue(roots.DefectsRoot)
 	a.Handler = a.mux()
 	return a, nil
 }
