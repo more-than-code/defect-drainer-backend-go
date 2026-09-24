@@ -839,7 +839,7 @@ func TestDeleteJobWhileRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFile(t, mark, 5*time.Second)
-	if err := br.DeleteJob(job.ID); err != nil {
+	if _, err := br.DeleteJob(job.ID); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -887,7 +887,7 @@ exit 0
 		t.Fatal(err)
 	}
 	<-entered
-	if err := br.DeleteJob(job.ID); err != nil {
+	if _, err := br.DeleteJob(job.ID); err != nil {
 		t.Fatal(err)
 	}
 	close(release)
@@ -1303,7 +1303,7 @@ func TestDeleteJobDuringSpawnBrief(t *testing.T) {
 	go func() { errc <- br.StartSpawn(job.ID, defects) }()
 	<-entered
 	del := make(chan error, 1)
-	go func() { del <- br.DeleteJob(job.ID) }()
+	go func() { _, err := br.DeleteJob(job.ID); del <- err }()
 	deadline := time.Now().Add(3 * time.Second)
 	for br.GetJob(job.ID) != nil {
 		if time.Now().After(deadline) {
@@ -1351,7 +1351,7 @@ func TestDeleteJobDuringSpawnAfterStart(t *testing.T) {
 	go func() { errc <- br.StartSpawn(job.ID, defects) }()
 	<-entered
 	del := make(chan error, 1)
-	go func() { del <- br.DeleteJob(job.ID) }()
+	go func() { _, err := br.DeleteJob(job.ID); del <- err }()
 	deadline := time.Now().Add(3 * time.Second)
 	for br.GetJob(job.ID) != nil {
 		if time.Now().After(deadline) {
@@ -1395,7 +1395,7 @@ func TestDeleteJobDropsPersistSlot(t *testing.T) {
 	if !before {
 		t.Fatal("expected persist slot after persistLive")
 	}
-	if err := br.DeleteJob(j.ID); err != nil {
+	if _, err := br.DeleteJob(j.ID); err != nil {
 		t.Fatal(err)
 	}
 	br.persistMu.Lock()

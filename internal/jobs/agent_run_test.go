@@ -214,7 +214,7 @@ func TestDeleteBetweenIterationsWaitsForLoop(t *testing.T) {
 	// the only one able to do.
 	loopBeforeNextHook = func() {
 		loopBeforeNextHook = nil
-		go func() { deleted <- br.DeleteJob(job.ID) }()
+		go func() { _, err := br.DeleteJob(job.ID); deleted <- err }()
 	}
 	t.Cleanup(func() {
 		spawnExitHook = nil

@@ -1010,12 +1010,20 @@ func (b *BatchRunner) persistLive(id string) error {
 	return err
 }
 
-// DeleteJob stops the child (signal + reap) then removes the job dir.
+// DeleteJob stops the child (signal + reap), removes the job's worktrees from
+// each product repo (git.DiscardWorktrees: registration pruned, branch deleted
+// only if merged), then removes the job dir. It returns that per-repo report.
 // The map entry is dropped first so a later appendLog/persistLive cannot
 // resurrect job.json. If StartSpawn is still in the startup window,
 // wait for it to install or abandon the child before RemoveAll.
-func (b *BatchRunner) DeleteJob(id string) error {
+func (b *BatchRunner) DeleteJob(id string) ([]git.WorktreeDiscard, error) {
 	b.mu.Lock()
+	var wts []git.WorktreeBinding
+	var appID string
+	if j := b.jobs[id]; j != nil {
+		wts = append(wts, j.Worktrees...)
+		appID = j.AppID
+	}
 	slot := b.procs[id]
 	var startDone, loopDone chan struct{}
 	if b.starting != nil {
@@ -1049,14 +1057,64 @@ func (b *BatchRunner) DeleteJob(id string) error {
 	if b.store != nil {
 		analytics.DeleteJobSummary(b.store.DB, id)
 	}
+	// The agent is dead and no loop can start another, so the worktrees can
+	// go: unregistered from each product repo, branch deleted only if merged.
+	cleanup := git.DiscardWorktrees(b.trustedBases(appID, wts), b.handoffDir(id))
 	ps := b.persistSlot(id)
 	ps.Lock()
-	err := os.RemoveAll(filepath.Join(paths.BatchJobsDir(b.dataRoot), id))
+	err := os.RemoveAll(b.handoffDir(id))
 	ps.Unlock()
 	b.persistMu.Lock()
 	delete(b.persist, id)
 	b.persistMu.Unlock()
-	return err
+	return cleanup, err
+}
+
+// DeletePreview reports what DeleteJob would do to each worktree — the
+// uncommitted files it discards and whether each branch goes — without
+// changing anything.
+func (b *BatchRunner) DeletePreview(id string) ([]git.WorktreeDiscard, error) {
+	j := b.GetJob(id)
+	if j == nil {
+		return nil, fmt.Errorf("job not found: %s", id)
+	}
+	return git.PlanDiscard(b.trustedBases(j.AppID, j.Worktrees), b.handoffDir(id)), nil
+}
+
+// trustedBases replaces each binding's BaseBranch/BaseRef with the base the
+// app's saved settings (SQLite) give that repo, resolved the way batch
+// creation does. job.json is agent-writable, and git.DiscardWorktrees treats
+// these refs as proof a branch is merged: a BaseRef set to the branch's own
+// tip would make unmerged work deletable. A repo the settings no longer list
+// keeps no base, so only HEAD and the branch's upstream count.
+func (b *BatchRunner) trustedBases(appID string, wts []git.WorktreeBinding) []git.WorktreeBinding {
+	var app *store.AppRecord
+	if b.store != nil && appID != "" {
+		app, _ = store.GetApp(b.store.DB, appID)
+	}
+	out := make([]git.WorktreeBinding, len(wts))
+	for i, w := range wts {
+		w.BaseBranch, w.BaseRef = "", ""
+		if app != nil {
+			for _, e := range app.RepoEntries {
+				if e.Name != w.Repo {
+					continue
+				}
+				branch := e.BaseBranch
+				if branch == "" {
+					branch = store.ParseGitRefName(app.BaseBranch, "main")
+				}
+				w.BaseBranch, w.BaseRef = branch, branch
+				if e.BaseSource != "local" {
+					remote := strings.TrimPrefix(store.ParseGitRefName(app.BaseRemote, "origin"), "origin/")
+					w.BaseRef = remote + "/" + branch
+				}
+				break
+			}
+		}
+		out[i] = w
+	}
+	return out
 }
 
 func (b *BatchRunner) setVerifyCancel(id string, cancel context.CancelFunc) {

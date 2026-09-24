@@ -154,3 +154,51 @@ func TestRestartRoutes(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// AC7 + the DELETE contract: the preview is read-only and maps 400/404;
+// DELETE answers with the per-repo cleanup report.
+func TestDeletePreviewAndCleanupRoutes(t *testing.T) {
+	data, defects := t.TempDir(), t.TempDir()
+	seedStoppedJob(t, data, "bjob_delapi", "grok", "failed")
+	app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, SkipMigrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(app.Close)
+
+	if bad := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_bad!/delete-preview", nil); bad.Code != http.StatusBadRequest {
+		t.Fatalf("invalid id: %d %s", bad.Code, bad.Body)
+	}
+	if nf := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_nope/delete-preview", nil); nf.Code != http.StatusNotFound {
+		t.Fatalf("unknown id: %d %s", nf.Code, nf.Body)
+	}
+	pre := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_delapi/delete-preview", nil)
+	var preview struct {
+		Repos []struct {
+			Repo  string `json:"repo"`
+			Error string `json:"error"`
+		} `json:"repos"`
+	}
+	if err := json.Unmarshal(pre.Body.Bytes(), &preview); err != nil || pre.Code != http.StatusOK || len(preview.Repos) != 1 {
+		t.Fatalf("preview: %d %s", pre.Code, pre.Body)
+	}
+	// The seeded worktree lives outside the handoff, so the guard reports it.
+	if !strings.Contains(preview.Repos[0].Error, "outside this job's handoff") {
+		t.Fatalf("guard not reported: %s", pre.Body)
+	}
+	if still := doJSON(t, app.Handler, http.MethodGet, "/api/batch-jobs/bjob_delapi", nil); still.Code != http.StatusOK {
+		t.Fatal("the preview must not delete anything")
+	}
+
+	del := doJSON(t, app.Handler, http.MethodDelete, "/api/batch-jobs/bjob_delapi", nil)
+	var out struct {
+		Ok      bool   `json:"ok"`
+		JobID   string `json:"jobId"`
+		Cleanup []struct {
+			Repo string `json:"repo"`
+		} `json:"cleanup"`
+	}
+	if err := json.Unmarshal(del.Body.Bytes(), &out); err != nil || del.Code != http.StatusOK || !out.Ok || out.JobID != "bjob_delapi" || len(out.Cleanup) != 1 {
+		t.Fatalf("delete: %d %s", del.Code, del.Body)
+	}
+}

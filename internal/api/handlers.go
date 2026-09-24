@@ -723,11 +723,27 @@ func (a *App) deleteBatchJob(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := a.Batches.DeleteJob(id); err != nil {
+	cleanup, err := a.Batches.DeleteJob(id)
+	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "jobId": id, "cleanup": cleanup})
+}
+
+// deletePreview says what DELETE would discard per repo; it changes nothing.
+func (a *App) deletePreview(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !store.IsSafeJobID(id) {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	repos, err := a.Batches.DeletePreview(id)
+	if err != nil {
+		httpx.WriteError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"repos": repos})
 }
 
 func (a *App) stopBatchJob(w http.ResponseWriter, r *http.Request) {

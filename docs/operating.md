@@ -100,16 +100,25 @@ branch. For that, start a fresh job.
 ### A fresh job
 Everything new (worktree, branch, baseline, session, budget): on **Defects**, select the same
 defect(s) and **Start fix** / **Start batch fix** again. Then delete the old job so nobody
-restarts it by mistake.
+restarts it by mistake; Delete also cleans its worktree out of the product repo.
 
 ### Delete
-Removes the job and its handoff folder, killing a live agent first. It does **not** unregister
-the worktree or delete the branch in the product repo. Afterwards, in each product repo:
+The confirm dialog first shows, per repo, what will go: any **uncommitted files** in the job's
+worktree (they are discarded) and whether the job branch is **deleted** or **kept**. Delete then
+kills a live agent, removes each worktree and unregisters it from its product repo, deletes the
+branch `defect-drainer/<BATCH-id>` **only if it is merged** (no commits beyond the base branch
+in App Settings, the repo's checked-out HEAD, or its own upstream), and removes the handoff folder. A kept branch is
+named in the result message with its unmerged-commit count. Delete it yourself once you no longer
+need those commits:
 
 ```bash
-git -C <product repo> worktree prune
 git -C <product repo> branch -D defect-drainer/<BATCH-id>   # discards that branch's commits
 ```
+
+Delete only ever touches worktrees inside the job's own handoff folder (symlinks resolved), only
+runs git in a repo where that worktree is actually registered, and only deletes branches named
+`defect-drainer/…`. The job record is agent-writable, so none of these decisions trust it. A job deleted before this behaviour existed (2026-09-24) may have left a
+registration behind; `git -C <product repo> worktree prune` clears it.
 
 ### Create PR / Merge / Refresh PRs
 GitHub bases show **Create PR** (pushes the job branch, opens a PR with host `gh`) and
