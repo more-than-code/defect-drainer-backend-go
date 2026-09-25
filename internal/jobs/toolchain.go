@@ -109,7 +109,7 @@ func writeFlutterShims(binDir, sdkDir, homeDir, pubCache string) error {
 	return nil
 }
 
-func provisionFlutterToolchain(handoffAbs string, worktrees []git.WorktreeBinding, onLog verifyLog) ToolchainProvision {
+func provisionFlutterToolchain(handoffAbs string, worktrees []git.WorktreeBinding, onLog verifyLog, strip []string) ToolchainProvision {
 	if onLog == nil {
 		onLog = func(string, string) {}
 	}
@@ -180,6 +180,7 @@ func provisionFlutterToolchain(handoffAbs string, worktrees []git.WorktreeBindin
 
 	pctx, pcancel := context.WithTimeout(context.Background(), 180*time.Second)
 	probe := exec.CommandContext(pctx, filepath.Join(binDir, "flutter"), "--version")
+	probe.Env = git.FilterInheritedEnv(os.Environ(), strip)
 	pout, perr := probe.CombinedOutput()
 	pcancel()
 	if perr != nil {

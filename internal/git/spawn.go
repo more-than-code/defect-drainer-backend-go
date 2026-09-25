@@ -71,6 +71,7 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 type lineForwarder struct {
 	mu     sync.Mutex
 	buf    []byte
+	secret []byte
 	emit   func(string)
 	ch     chan string
 	done   chan struct{}
@@ -111,38 +112,92 @@ func (f *lineForwarder) Write(p []byte) (int, error) {
 	if f == nil {
 		return len(p), nil
 	}
-	norm := bytes.ReplaceAll(p, []byte("\r\n"), []byte("\n"))
-	norm = bytes.ReplaceAll(norm, []byte("\r"), []byte("\n"))
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
 		return len(p), nil
 	}
-	f.buf = append(f.buf, norm...)
-	var lines []string
-	for {
-		i := bytes.IndexByte(f.buf, '\n')
-		if i >= 0 {
-			line := string(f.buf[:i])
-			f.buf = f.buf[i+1:]
-			if strings.TrimSpace(line) != "" {
-				lines = append(lines, capLine(line))
-			}
-			continue
-		}
-		if len(f.buf) >= maxLogBlock {
-			lines = append(lines, capLine(string(f.buf[:maxLogBlock])))
-			f.buf = append([]byte(nil), f.buf[maxLogBlock:]...)
-			continue
-		}
-		break
-	}
+	f.buf = append(f.buf, p...)
+	f.redactBuf()
+	lines := f.drain(false)
 	ch := f.ch
 	f.mu.Unlock()
 	for _, line := range lines {
 		ch <- line
 	}
 	return len(p), nil
+}
+
+// redactBuf replaces the secret before any newline normalization or cut, and
+// holds back len(secret)-1 bytes inside drain so a value split across writes
+// is still one match.
+func (f *lineForwarder) redactBuf() {
+	if len(f.secret) == 0 || len(f.buf) == 0 {
+		return
+	}
+	f.buf = bytes.ReplaceAll(f.buf, f.secret, []byte(redactedMark))
+}
+
+func (f *lineForwarder) drain(flush bool) []string {
+	limit := f.normalizeSafe(flush)
+	if limit == 0 {
+		return nil
+	}
+	var lines []string
+	for {
+		window := f.buf[:limit]
+		i := bytes.IndexByte(window, '\n')
+		if i >= 0 {
+			line := string(f.buf[:i])
+			f.buf = f.buf[i+1:]
+			limit = len(f.buf)
+			if !flush && len(f.secret) > 1 {
+				keep := len(f.secret) - 1
+				if limit <= keep {
+					break
+				}
+				limit -= keep
+			}
+			if strings.TrimSpace(line) != "" {
+				lines = append(lines, capLine(line))
+			}
+			continue
+		}
+		if limit >= maxLogBlock {
+			lines = append(lines, capLine(string(f.buf[:maxLogBlock])))
+			f.buf = append([]byte(nil), f.buf[maxLogBlock:]...)
+			limit = len(f.buf)
+			if !flush && len(f.secret) > 1 {
+				keep := len(f.secret) - 1
+				if limit <= keep {
+					break
+				}
+				limit -= keep
+			}
+			continue
+		}
+		break
+	}
+	return lines
+}
+
+// normalizeSafe turns CR line endings into LF in the portion of buf that is
+// safe to emit. The held-back tail is left raw so a secret containing a
+// carriage return is still intact for the next Write.
+func (f *lineForwarder) normalizeSafe(flush bool) int {
+	keep := 0
+	if !flush && len(f.secret) > 1 {
+		keep = len(f.secret) - 1
+	}
+	if keep >= len(f.buf) {
+		return 0
+	}
+	head := f.buf[:len(f.buf)-keep]
+	tail := append([]byte(nil), f.buf[len(f.buf)-keep:]...)
+	head = bytes.ReplaceAll(head, []byte("\r\n"), []byte("\n"))
+	head = bytes.ReplaceAll(head, []byte("\r"), []byte("\n"))
+	f.buf = append(head, tail...)
+	return len(head)
 }
 
 // Flush emits a trailing partial line, closes the consumer, and waits for it
@@ -158,16 +213,14 @@ func (f *lineForwarder) Flush() {
 		<-f.done
 		return
 	}
-	rem := ""
-	if s := strings.TrimSpace(string(f.buf)); s != "" {
-		rem = capLine(s)
-	}
+	f.redactBuf()
+	lines := f.drain(true)
 	f.buf = nil
 	f.closed = true
 	ch := f.ch
 	f.mu.Unlock()
-	if rem != "" {
-		ch <- rem
+	for _, line := range lines {
+		ch <- line
 	}
 	close(ch)
 	<-f.done
@@ -232,6 +285,17 @@ type CodingAgentOpts struct {
 	// MaxTurns is the app's configured turn cap. Zero falls back to the env
 	// override, then the built-in default.
 	MaxTurns int
+	// Prompt, when set, replaces the batch-fix prompt. Empty keeps today's text.
+	Prompt string
+	// ContinuePrompt, when set, replaces ContinuePrompt on -c / -r. Empty
+	// keeps the batch-fix continue prompt.
+	ContinuePrompt string
+	// Secret is redacted from agent.log. It is never written anywhere else
+	// by this function. Empty disables the redactor.
+	Secret string
+	// StripEnv are host environment names removed before ExtraEnv is applied.
+	// DD_TEST_ACCOUNT_PASSWORD is always removed from the inherited environment.
+	StripEnv []string
 }
 
 // agentStream parses streaming-json (NDJSON) stdout **before** lineForwarder
@@ -252,6 +316,7 @@ type agentStream struct {
 	// textPend joins word-sized `text` deltas. Write runs on os/exec's copy
 	// loop and Flush runs after Wait, so this buffer needs no lock.
 	textPend []byte
+	secret   []byte
 }
 
 func (a *agentStream) Write(p []byte) (int, error) {
@@ -396,25 +461,49 @@ func (a *agentStream) appendText(payload string) {
 		return
 	}
 	a.textPend = append(a.textPend, payload...)
+	if len(a.secret) > 0 {
+		a.textPend = bytes.ReplaceAll(a.textPend, a.secret, []byte(redactedMark))
+	}
 	a.takeTextLines()
 }
 
 // takeTextLines emits completed lines and any maxLogBlock chunk. A short
 // partial stays buffered. Newline-terminated lines keep their own spacing;
 // a line that is only whitespace is dropped.
+func (a *agentStream) textLimit(flush bool) int {
+	n := len(a.textPend)
+	if !flush && len(a.secret) > 1 {
+		keep := len(a.secret) - 1
+		if n <= keep {
+			return 0
+		}
+		return n - keep
+	}
+	return n
+}
+
 func (a *agentStream) takeTextLines() {
-	for len(a.textPend) > 0 {
-		end := len(a.textPend)
+	a.takeText(false)
+}
+
+func (a *agentStream) takeText(flush bool) {
+	limit := a.textLimit(flush)
+	for limit > 0 {
+		end := limit
 		if end > maxLogBlock {
 			end = maxLogBlock
 		}
 		if i := bytes.IndexByte(a.textPend[:end], '\n'); i >= 0 {
 			line := string(a.textPend[:i])
 			a.textPend = a.textPend[i+1:]
+			limit = a.textLimit(flush)
 			if strings.TrimSpace(line) != "" {
 				a.emit(a.text, line)
 			}
 			continue
+		}
+		if !flush && limit < maxLogBlock {
+			break
 		}
 		if len(a.textPend) < maxLogBlock {
 			break
@@ -425,6 +514,7 @@ func (a *agentStream) takeTextLines() {
 		}
 		chunk := string(a.textPend[:cut])
 		a.textPend = a.textPend[cut:]
+		limit = a.textLimit(flush)
 		if strings.TrimSpace(chunk) != "" {
 			a.emit(a.text, chunk)
 		}
@@ -460,7 +550,10 @@ func textCut(buf []byte) int {
 
 // flushText emits the short partial as one trimmed line.
 func (a *agentStream) flushText() {
-	a.takeTextLines()
+	if len(a.secret) > 0 {
+		a.textPend = bytes.ReplaceAll(a.textPend, a.secret, []byte(redactedMark))
+	}
+	a.takeText(true)
 	if s := strings.TrimSpace(string(a.textPend)); s != "" {
 		a.emit(a.text, s)
 	}
@@ -599,6 +692,55 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 	return strings.Join(parts, "\n")
 }
 
+// filterInheritedEnv drops DD_TEST_ACCOUNT_PASSWORD and any extra names from
+// the host environment before a coding agent is spawned.
+// FilterInheritedEnv drops DD_TEST_ACCOUNT_PASSWORD and any extra names.
+// Verify commands and the toolchain probe use the same list as the agent.
+func FilterInheritedEnv(environ, extra []string) []string {
+	return filterInheritedEnv(environ, extra)
+}
+
+// dropListedEnv removes strip-list keys after the child env is fully built.
+// keep retains the test job's intentional DD_TEST_ACCOUNT_PASSWORD assignment.
+func dropListedEnv(environ, strip []string, keep map[string]bool) []string {
+	drop := map[string]bool{}
+	for _, name := range strip {
+		if name != "" && !keep[name] {
+			drop[name] = true
+		}
+	}
+	if len(drop) == 0 {
+		return environ
+	}
+	out := make([]string, 0, len(environ))
+	for _, e := range environ {
+		key, _, ok := strings.Cut(e, "=")
+		if ok && drop[key] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func filterInheritedEnv(environ, extra []string) []string {
+	drop := map[string]bool{"DD_TEST_ACCOUNT_PASSWORD": true}
+	for _, name := range extra {
+		if name != "" {
+			drop[name] = true
+		}
+	}
+	out := make([]string, 0, len(environ))
+	for _, e := range environ {
+		key, _, ok := strings.Cut(e, "=")
+		if !ok || drop[key] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // StartCodingAgent execs the resolved bin. Empty worktrees refuse spawn.
 // sandbox is the app grok_sandbox setting; empty falls back to strict.
 // opts may carry toolchain env, a job-scoped sandbox profile name, and prompt
@@ -621,6 +763,9 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		sandboxArg = opts.SandboxProfile
 	}
 	prompt := buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox, worktrees, opts)
+	if opts != nil && opts.Prompt != "" {
+		prompt = opts.Prompt
+	}
 	// App Settings wins, then either env spelling, then the built-in default.
 	// A Flutter repo burns turns far faster than a Node one — each pub get,
 	// analyze and test is a turn — so this is per app, not per install.
@@ -642,11 +787,15 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	// turn budget cannot drift between iterations.
 	args := []string{}
 	promptArg := prompt
+	cont := ContinuePrompt
+	if opts != nil && opts.ContinuePrompt != "" {
+		cont = opts.ContinuePrompt
+	}
 	if opts != nil && opts.ResumeSession != "" {
-		promptArg = ContinuePrompt
+		promptArg = cont
 		args = append(args, "-r", opts.ResumeSession)
 	} else if opts != nil && opts.Continue {
-		promptArg = ContinuePrompt
+		promptArg = cont
 		args = append(args, "-c")
 	}
 	args = append(args,
@@ -675,7 +824,14 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	// SKILL_FORGE_AGENT_ROLE marks the child as the worker end of the
 	// delegation. Never set it on the serve process: a leaked value would tell
 	// a human session started from the same shell that it is a worker.
-	cmd.Env = append(os.Environ(),
+	// Inherited DD_TEST_ACCOUNT_PASSWORD and any app env: secret names are
+	// removed here. ExtraEnv may set DD_TEST_ACCOUNT_PASSWORD again for a
+	// test job; a fix job never does.
+	var strip []string
+	if opts != nil {
+		strip = opts.StripEnv
+	}
+	cmd.Env = append(filterInheritedEnv(os.Environ(), strip),
 		"CI=1",
 		"GROK_SANDBOX="+sandboxArg,
 		"SKILL_FORGE_AGENT_ROLE=worker",
@@ -689,14 +845,28 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		}
 	}
 	cmd.Env = append(cmd.Env, "DEFECT_DRAINER_WORKTREES="+strings.Join(wtPaths, ":"))
+	keep := map[string]bool{}
+	if opts != nil {
+		if _, ok := opts.ExtraEnv["DD_TEST_ACCOUNT_PASSWORD"]; ok {
+			keep["DD_TEST_ACCOUNT_PASSWORD"] = true
+		}
+	}
+	cmd.Env = dropListedEnv(cmd.Env, strip, keep)
 	outFwd := newLineForwarder(onStdout)
 	errFwd := newLineForwarder(onStderr)
 	stream := &agentStream{text: outFwd, errs: errFwd}
+	if opts != nil && opts.Secret != "" {
+		sec := []byte(opts.Secret)
+		outFwd.secret = sec
+		errFwd.secret = sec
+		stream.secret = sec
+	}
 	if opts != nil {
 		stream.onEnd = opts.OnEnd
 		stream.onMaxTurns = opts.OnMaxTurns
 	}
 	logf, err := os.OpenFile(handoffAbs+"/agent.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	var stdoutRed, stderrRed *redactWriter
 	if err == nil {
 		var start int64
 		if st, serr := logf.Stat(); serr == nil {
@@ -704,15 +874,30 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		}
 		tee := &cappedWriter{w: logf, n: start, limit: maxAgentLogBytes}
 		// stdout is NDJSON and goes through the parser, which owns the raw tee.
-		// stderr is plain text and keeps the old path.
-		stream.raw = tee
+		// stderr is plain text and keeps the old path. Each stream redacts on
+		// its own so a secret split across two writes of that stream is caught.
+		var rawOut io.Writer = tee
+		var rawErr io.Writer = tee
+		if opts != nil && opts.Secret != "" {
+			stdoutRed = newRedactWriter(tee, opts.Secret)
+			stderrRed = newRedactWriter(tee, opts.Secret)
+			rawOut = stdoutRed
+			rawErr = stderrRed
+		}
+		stream.raw = rawOut
 		cmd.Stdout = stream
-		cmd.Stderr = io.MultiWriter(tee, errFwd)
+		cmd.Stderr = io.MultiWriter(rawErr, errFwd)
 	} else {
 		cmd.Stdout = stream
 		cmd.Stderr = errFwd
 	}
 	flush := func() {
+		if stdoutRed != nil {
+			_ = stdoutRed.Flush()
+		}
+		if stderrRed != nil {
+			_ = stderrRed.Flush()
+		}
 		stream.Flush()
 		outFwd.Flush()
 		errFwd.Flush()

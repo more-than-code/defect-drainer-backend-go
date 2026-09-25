@@ -30,6 +30,8 @@ It is **not** tied to one vendor product name, a ticket bus, or a live sprint tr
 | **5. Ship** | Host `git`, and `gh` when the repo source is GitHub | A GitHub base opens a PR onto the saved branch. A local checkout shows uncommitted files and a message; confirming commits them onto the job branch, then merges that branch into the local base. The primary tree changes only when it is already on that branch and clean |
 | **6. Close** | Resolve defect with resolution + fix_evidence | Bucket → resolved |
 
+A **test run** is the same harness pointed at a plan instead of a defect batch. `execute:"agent"` checks the product out detached at a chosen commit, hands the agent `BRIEF.md` / `PROCESS.md` / `SKILLS.md`, and harvests `RUN.md`, `results/<key>.md` and fresh screenshots. The run ends at `awaiting_review`. Nothing is committed, pushed or merged; a dirty worktree is only a warning. When the plan's account names an `env:NAME` password, that value is injected as `DD_TEST_ACCOUNT_PASSWORD` and redacted from logs and harvested step text. A value split across stdout and stderr, or bytes inside a screenshot, is not covered.
+
 ---
 
 ## Verification: who decides a fix is real

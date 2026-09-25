@@ -23,7 +23,7 @@ func TestProvisionFlutterNoPinSkips(t *testing.T) {
 	var logs []string
 	got := provisionFlutterToolchain(handoff, []git.WorktreeBinding{{Repo: "demo", WorktreeAbs: wt}}, func(line, _ string) {
 		logs = append(logs, line)
-	})
+	}, nil)
 	if got.Ok {
 		t.Fatalf("no pin must skip, got %+v", got)
 	}
@@ -52,7 +52,7 @@ func TestProvisionFlutterConflictingPinsSkips(t *testing.T) {
 	got := provisionFlutterToolchain(t.TempDir(), []git.WorktreeBinding{
 		{Repo: "one", WorktreeAbs: a},
 		{Repo: "two", WorktreeAbs: b},
-	}, func(string, string) {})
+	}, func(string, string) {}, nil)
 	if got.Ok {
 		t.Fatal("conflicting pins must skip")
 	}
@@ -66,7 +66,7 @@ func TestProvisionFlutterMissingSourceSkips(t *testing.T) {
 	var logs []string
 	got := provisionFlutterToolchain(t.TempDir(), []git.WorktreeBinding{{Repo: "demo", WorktreeAbs: wt}}, func(line, _ string) {
 		logs = append(logs, line)
-	})
+	}, nil)
 	if got.Ok {
 		t.Fatal("missing source must skip")
 	}

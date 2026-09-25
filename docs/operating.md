@@ -143,6 +143,24 @@ can be run again after a Resume: it pushes to the same branch and reports the op
 | worktree missing: `<repo>` | The worktree dir is gone or is no longer a checkout. Start a fresh job |
 | PR merged/closed — file a new batch | Start a fresh job |
 | not a coding-agent job | A `manual` job; there is no agent to restart |
+| test run is reviewed | The run is already reviewed. Start a new run |
+| test run is abandoned | The run was abandoned. Start a new run |
+| test run is deleted | The run row is gone. Start a new run |
+
+## Test-run jobs
+
+A test run started with `execute:"agent"` is a job of `kind:"test_run"`. It has no batch and no branch. Stop, Resume, Re-run and Delete are the same buttons as a fix job, with these differences:
+
+- **Stop** kills the agent and does not import results. The run stays `in_progress` (or `queued` if the agent had not started).
+- **Resume** and **Re-run** work from `awaiting_review`: the run goes back to `in_progress`, `started_at` is now, and `finished_at` is cleared. They are refused while the run is reviewed, abandoned or deleted. They are also refused when the account password env var is unset, shorter than 6 bytes, or cannot be redacted safely (`409`, same text as create).
+- **Abandon** also accepts a `queued` run whose job is not live, so a run whose job stopped or failed before `running` can be closed.
+- **Delete** removes the detached worktrees and the handoff. There is no job branch to keep or delete.
+- A **failed** job stays `running` while it imports whatever result files and screenshots exist, then becomes `failed`, and leaves the run `in_progress`. A job that reaches `completed` (including by hitting the iteration or wall cap) imports them and moves the run to `awaiting_review`. Screenshots from before this run's start are not imported again.
+- Ship preview, Create PR and Refresh PRs answer `409` `test run jobs do not ship`.
+
+The account password is an env var named by the account's `secret_ref` (`env:NAME`). Set that variable in the environment `serve` itself starts with, before you start it. Changing the variable requires restarting `serve`; a running process keeps the environment it was given. The value is passed to the agent only as `DD_TEST_ACCOUNT_PASSWORD`. Job logs, `agent.log`, and harvested step text replace that exact value with `[redacted]` before a line is cut at 24000 bytes. A secret split across stdout and stderr, or bytes inside a screenshot, is not redacted. Do not use a password that is a piece of the word `[redacted]`. Do not name the variable `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `PWD`, `LANG`, `TERM`, `CI`, or anything starting with `LC_`, `GROK_`, `SKILL_FORGE_`, `DEFECT_DRAINER_`, `DEFECT_CHANNEL_`, `DD_`, `GIT_`, or `GH_` — save answers `400` `secret_ref env:NAME is reserved; use a dedicated variable such as QA_PASSWORD`, and a row already saved that way fails the next spawn with the same text. Verify commands and the toolchain probe never receive the password or any other app `env:` secret. On an agent run, `started_at` is the create time until the job starts.
+
+**Rollback precondition.** Before you run an older `defect-drainer` binary, no test job may be `queued` or `running`. An older binary does not know `kind:"test_run"` and would drive those jobs as fix jobs.
 
 ## Restarting the backend
 
@@ -152,8 +170,10 @@ reliably stop them, and a restarted `serve` does not know they exist. So the new
 orphan. Always restart cleanly, or clean up after.
 
 A job left `queued` — waiting on the simulator lease, with no agent of its own — stays
-`queued` across a restart and starts on its own, oldest first. A job that was `running` still
-comes back `failed` / `interrupted by backend restart`.
+`queued` across a restart and starts on its own, oldest first. A test job waiting on that
+lease is included. A job that was `running` still comes back `failed` /
+`interrupted by backend restart`. A test run is left in whatever status it already had;
+hydrate does not move it.
 
 ### Clean restart
 1. Check for live jobs:

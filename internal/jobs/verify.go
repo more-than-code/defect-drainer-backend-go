@@ -141,8 +141,8 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 func strPtr(s string) *string { return &s }
 func intPtr(n int) *int       { return &n }
 
-func mergeVerifyEnv(extra map[string]string) []string {
-	env := append([]string{}, os.Environ()...)
+func mergeVerifyEnv(extra map[string]string, strip []string) []string {
+	env := git.FilterInheritedEnv(os.Environ(), strip)
 	env = append(env, "CI=1")
 	for k, v := range extra {
 		if k == "" {
@@ -150,7 +150,30 @@ func mergeVerifyEnv(extra map[string]string) []string {
 		}
 		env = append(env, k+"="+v)
 	}
-	return env
+	// extra (the Flutter PATH) is applied after the inherited scrub. Drop the
+	// strip list again, and never hand a verify command the test password.
+	return dropVerifyEnv(env, append(append([]string{}, strip...), "DD_TEST_ACCOUNT_PASSWORD"))
+}
+
+func dropVerifyEnv(environ, strip []string) []string {
+	drop := map[string]bool{}
+	for _, name := range strip {
+		if name != "" {
+			drop[name] = true
+		}
+	}
+	if len(drop) == 0 {
+		return environ
+	}
+	out := make([]string, 0, len(environ))
+	for _, e := range environ {
+		key, _, ok := strings.Cut(e, "=")
+		if ok && drop[key] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 type verifyLog func(line string, level string)
@@ -186,7 +209,7 @@ func snapshotWorktreeReals(worktrees []git.WorktreeBinding) map[string]string {
 	return out
 }
 
-func runVerification(ctx context.Context, commands []store.VerifyCommand, worktrees []git.WorktreeBinding, handoffAbs string, repoEntries []store.AppRepoEntry, extraEnv map[string]string, realByRepo map[string]string, onLog verifyLog) VerificationRun {
+func runVerification(ctx context.Context, commands []store.VerifyCommand, worktrees []git.WorktreeBinding, handoffAbs string, repoEntries []store.AppRepoEntry, extraEnv map[string]string, realByRepo map[string]string, onLog verifyLog, strip []string) VerificationRun {
 	startedAt := db.NowIso()
 	results := make([]VerifyResult, 0, len(commands))
 	if onLog == nil {
@@ -240,7 +263,7 @@ func runVerification(ctx context.Context, commands []store.VerifyCommand, worktr
 		cmdCtx, cancel := context.WithTimeout(ctx, verifyTimeout)
 		cmd := exec.CommandContext(cmdCtx, "sh", "-c", entry.Command)
 		cmd.Dir = wt.WorktreeAbs
-		cmd.Env = mergeVerifyEnv(extraEnv)
+		cmd.Env = mergeVerifyEnv(extraEnv, strip)
 		var out cappedBuffer
 		cmd.Stdout = &out
 		cmd.Stderr = &out

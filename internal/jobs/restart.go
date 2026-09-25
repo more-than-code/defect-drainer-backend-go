@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/joe/defect-drainer-go/internal/db"
 	"github.com/joe/defect-drainer-go/internal/git"
 	"github.com/joe/defect-drainer-go/internal/paths"
+	"github.com/joe/defect-drainer-go/internal/store"
 )
 
 // RestartCheck says whether an operator may Re-run or Resume a job and, when
@@ -41,6 +43,7 @@ type restartFacts struct {
 	live            bool
 	missingWorktree string // first repo whose worktree is gone; "" when all present
 	sessionFound    bool
+	testRunBlock    string // reviewed, abandoned or deleted test run
 }
 
 func blockedBy(reason string) *RestartCheck { return &RestartCheck{Reason: reason} }
@@ -52,6 +55,8 @@ func rerunCheck(j *Job, f restartFacts) *RestartCheck {
 		return blockedBy("not a coding-agent job")
 	case f.live:
 		return blockedBy(ErrJobLive.Error())
+	case f.testRunBlock != "":
+		return blockedBy(f.testRunBlock)
 	case len(j.Worktrees) == 0:
 		return blockedBy("job has no worktrees")
 	case f.missingWorktree != "":
@@ -126,7 +131,7 @@ func (b *BatchRunner) isLive(id string) bool {
 // fillRestartChecks sets the computed checks on a clone for an API read.
 func (b *BatchRunner) fillRestartChecks(c *Job, live bool) {
 	_, found := git.LatestGrokSession(b.handoffDir(c.ID))
-	f := restartFacts{live: live, missingWorktree: missingWorktree(c.Worktrees), sessionFound: found}
+	f := restartFacts{live: live, missingWorktree: missingWorktree(c.Worktrees), sessionFound: found, testRunBlock: b.testRunBlock(c)}
 	c.Rerunnable = rerunCheck(c, f)
 	c.Resumable = resumeCheck(c, f)
 }
@@ -168,7 +173,13 @@ func (b *BatchRunner) Restart(jobID, defectsRoot string, resume bool) (*Job, err
 	}
 	// Disk probes stay outside the lock; only liveness must be read under it.
 	session, found := git.LatestGrokSession(b.handoffDir(jobID))
-	f := restartFacts{missingWorktree: missingWorktree(c.Worktrees), sessionFound: found}
+	f := restartFacts{missingWorktree: missingWorktree(c.Worktrees), sessionFound: found, testRunBlock: b.testRunBlock(c)}
+	var secretErr error
+	if c.isTestRun() {
+		if _, err := b.readTestSecret(c); err != nil {
+			secretErr = err
+		}
+	}
 
 	b.mu.Lock()
 	j := b.jobs[jobID]
@@ -186,7 +197,14 @@ func (b *BatchRunner) Restart(jobID, defectsRoot string, resume bool) (*Job, err
 		if f.live {
 			return nil, ErrJobLive
 		}
+		if strings.HasPrefix(check.Reason, "test run is ") {
+			return nil, Conflict(check.Reason)
+		}
 		return nil, errors.New(check.Reason)
+	}
+	if secretErr != nil {
+		b.mu.Unlock()
+		return nil, Conflict(secretErr.Error())
 	}
 	mode, line := spawnRerun, "re-run requested — new agent session on the existing worktrees"
 	if resume {
@@ -198,22 +216,44 @@ func (b *BatchRunner) Restart(jobID, defectsRoot string, resume bool) (*Job, err
 	j.Error = ""
 	j.RunStartedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	// These describe the previous run's code; this run replaces them.
-	j.Verification = nil
-	j.DiffHygiene = nil
+	// A test job keeps them until the child has started: a failed restart,
+	// and a sim-lease queue that returns before the child, must not discard
+	// the previous report.
+	if !j.isTestRun() {
+		j.Verification = nil
+		j.DiffHygiene = nil
+	}
 	b.appendLogLocked(j, line, "info", "DefectDrainer")
 	batchID, defectIDs := j.BatchID, append([]string(nil), j.DefectIDs...)
+	testRun := j.isTestRun()
 	b.mu.Unlock()
 	b.persistLive(jobID)
 
 	// SQL off the mutex (see CreatePRs). The failed/cancelled sync reopened
-	// the defects; this run owns them again.
-	_, _ = b.store.DB.Exec(`UPDATE batches SET status = ?, updated_at = ? WHERE id = ?`, "in_progress", db.NowIso(), batchID)
-	b.FlipInProgress(defectIDs)
+	// the defects; this run owns them again. A test job has no batch and no defects.
+	if !testRun {
+		_, _ = b.store.DB.Exec(`UPDATE batches SET status = ?, updated_at = ? WHERE id = ?`, "in_progress", db.NowIso(), batchID)
+		b.FlipInProgress(defectIDs)
+	}
 
 	if err := b.startSpawn(jobID, defectsRoot, mode, session); err != nil {
+		if testRun {
+			b.MarkFailed(jobID, "", err.Error())
+			return nil, jobConflict(err)
+		}
 		b.MarkFailed(jobID, batchID, err.Error())
 		b.SyncBatchAndDefects(b.GetJob(jobID), "failed")
-		return nil, err
+		return nil, jobConflict(err)
 	}
 	return b.GetJob(jobID), nil
+}
+
+// jobConflict turns a store 409 from the restart/spawn path into the error
+// the API already maps to HTTP 409. Other errors stay as they are.
+func jobConflict(err error) error {
+	var op *store.OpError
+	if errors.As(err, &op) && op != nil && op.Status == 409 {
+		return Conflict(op.Error())
+	}
+	return err
 }

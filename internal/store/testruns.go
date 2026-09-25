@@ -153,7 +153,8 @@ func (r TestRun) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// CreateRunInput is POST /api/test-runs. Execute must be "manual".
+// CreateRunInput is POST /api/test-runs. Execute is "manual" or, on the agent
+// path only, "agent".
 type CreateRunInput struct {
 	AppID        string
 	PlanID       string
@@ -388,118 +389,82 @@ func clientStepStatus(status string) error {
 }
 
 // CreateRun snapshots plan steps (or starts empty) and leaves the run in_progress.
+// execute=agent and executor=dd-job stay rejected here. The agent path is CreateAgentRun.
 func CreateRun(sqlDB *sql.DB, in CreateRunInput) (TestRun, error) {
-	switch in.Execute {
-	case "agent":
-		return TestRun{}, badRequest("execute=agent is not available yet")
-	case "manual":
-	default:
-		return TestRun{}, badRequest(`execute must be "manual"`)
-	}
-	executor := strings.TrimSpace(in.Executor)
-	if executor == "" {
-		executor = "operator"
-	}
-	switch executor {
-	case "operator", "agent-session":
-	case "dd-job":
-		return TestRun{}, badRequest("executor=dd-job is not available yet")
-	default:
-		return TestRun{}, badRequest("executor must be operator or agent-session")
-	}
-	executedBy, err := trimLimit("executed_by", in.ExecutedBy, maxActorLen, false)
-	if err != nil {
-		return TestRun{}, err
-	}
+	return insertRun(sqlDB, in, false, "")
+}
+
+// PreviewAgentRun validates an execute=agent body the same way CreateRun
+// validates a manual one, and returns the env and refs that would be stored.
+// It writes nothing.
+func PreviewAgentRun(sqlDB *sql.DB, in CreateRunInput) (map[string]any, []RunRef, error) {
+	in.Execute = "agent"
+	var env map[string]any
+	var refs []RunRef
+	err := withTx(sqlDB, func(tx *sql.Tx) error {
+		p, err := prepareRun(tx, in, true)
+		if err != nil {
+			return err
+		}
+		env, refs = p.env, p.refs
+		return nil
+	})
+	return env, refs, err
+}
+
+// CreateAgentRun inserts a queued dd-job run. jobID is stored on the row.
+// Validation matches CreateRun; executor is always dd-job and executed_by
+// defaults to dd-job.
+func CreateAgentRun(sqlDB *sql.DB, in CreateRunInput, jobID string) (TestRun, error) {
+	in.Execute = "agent"
+	return insertRun(sqlDB, in, true, strings.TrimSpace(jobID))
+}
+
+type preparedRun struct {
+	appID       string
+	planID      any
+	planVersion any
+	title       string
+	executor    string
+	executedBy  string
+	env         map[string]any
+	envJSON     string
+	refs        []RunRef
+	refsJSON    string
+}
+
+func insertRun(sqlDB *sql.DB, in CreateRunInput, agent bool, jobID string) (TestRun, error) {
 	var out TestRun
-	err = withTx(sqlDB, func(tx *sql.Tx) error {
-		// Accounts and repo names are read in this transaction, not from a
-		// snapshot taken before it.
-		app, err := requireApp(tx, in.AppID)
-		if err != nil {
-			return err
-		}
-		var plan *TestPlan
-		if strings.TrimSpace(in.PlanID) != "" {
-			if !IsSafePlanID(in.PlanID) {
-				return notFound("test plan not found")
-			}
-			p, err := loadPlan(tx, in.PlanID, true)
-			if err != nil {
-				return err
-			}
-			if p.AppID != app.ID {
-				return badRequest("plan does not belong to app")
-			}
-			if p.Archived {
-				return badRequest("plan is archived")
-			}
-			plan = &p
-		}
-		title := strings.TrimSpace(in.Title)
-		if title == "" {
-			if plan != nil {
-				title = plan.Title
-			} else {
-				title = "Exploratory run"
-			}
-		}
-		if len(title) > maxTitleLen {
-			return badRequest("title too long")
-		}
-		env := map[string]any{}
-		if plan != nil {
-			for k, v := range plan.Env {
-				env[k] = v
-			}
-		}
-		for k, v := range in.Env {
-			env[k] = v
-		}
-		if strings.TrimSpace(in.AccountLabel) != "" {
-			acc, ok := findTestAccount(app.TestAccounts, in.AccountLabel)
-			if !ok {
-				return badRequest("unknown account_label")
-			}
-			env["account"] = map[string]any{
-				"label": acc.Label, "username": acc.Username,
-				"environment": acc.Environment, "secret_ref": acc.SecretRef,
-			}
-		}
-		envJSON, err := marshalEnv(env)
-		if err != nil {
-			return err
-		}
-		refs, err := normalizeRefs(app, in.Refs)
-		if err != nil {
-			return err
-		}
-		refsJSON, err := json.Marshal(refs)
+	err := withTx(sqlDB, func(tx *sql.Tx) error {
+		p, err := prepareRun(tx, in, agent)
 		if err != nil {
 			return err
 		}
 		id := MakeRunID(time.Now())
 		ts := db.NowIso()
-		var planID any
-		var planVersion any
-		if plan != nil {
-			planID = plan.ID
-			planVersion = plan.Version
+		status := "in_progress"
+		var job any
+		if agent {
+			status = "queued"
+			if jobID != "" {
+				job = jobID
+			}
 		}
 		if _, err := tx.Exec(`INSERT INTO test_runs (
 			id, app_id, plan_id, plan_version, title, executor, executed_by, job_id,
 			env_json, refs_json, status, reviewed_by, reviewed_at, review_note,
 			started_at, finished_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'in_progress', '', NULL, '', ?, NULL, ?, ?)`,
-			id, app.ID, planID, planVersion, title, executor, executedBy, envJSON, string(refsJSON), ts, ts, ts); err != nil {
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, '', ?, NULL, ?, ?)`,
+			id, p.appID, p.planID, p.planVersion, p.title, p.executor, p.executedBy, job,
+			p.envJSON, p.refsJSON, status, ts, ts, ts); err != nil {
 			return err
 		}
-		if plan != nil {
+		if p.planID != nil {
 			if _, err := tx.Exec(`INSERT INTO test_step_results (
 				run_id, step_key, position, section, action, expected, exploratory,
 				status, actual, evidence_json, defect_id, review, review_note, updated_at
 			) SELECT ?, key, position, section, action, expected, 0, 'pending', '', '[]', NULL, '', '', ?
-			  FROM test_plan_steps WHERE plan_id = ?`, id, ts, plan.ID); err != nil {
+			  FROM test_plan_steps WHERE plan_id = ?`, id, ts, p.planID); err != nil {
 				return err
 			}
 		}
@@ -507,6 +472,119 @@ func CreateRun(sqlDB *sql.DB, in CreateRunInput) (TestRun, error) {
 		return err
 	})
 	return out, err
+}
+
+func prepareRun(tx *sql.Tx, in CreateRunInput, agent bool) (preparedRun, error) {
+	var zero preparedRun
+	if agent {
+		if in.Execute != "agent" {
+			return zero, badRequest(`execute must be "agent"`)
+		}
+	} else {
+		switch in.Execute {
+		case "agent":
+			return zero, badRequest("execute=agent is not available yet")
+		case "manual":
+		default:
+			return zero, badRequest(`execute must be "manual"`)
+		}
+	}
+	executor := strings.TrimSpace(in.Executor)
+	if agent {
+		executor = "dd-job"
+	} else {
+		if executor == "" {
+			executor = "operator"
+		}
+		switch executor {
+		case "operator", "agent-session":
+		case "dd-job":
+			return zero, badRequest("executor=dd-job is not available yet")
+		default:
+			return zero, badRequest("executor must be operator or agent-session")
+		}
+	}
+	executedBy, err := trimLimit("executed_by", in.ExecutedBy, maxActorLen, false)
+	if err != nil {
+		return zero, err
+	}
+	if agent && executedBy == "" {
+		executedBy = "dd-job"
+	}
+	app, err := requireApp(tx, in.AppID)
+	if err != nil {
+		return zero, err
+	}
+	var plan *TestPlan
+	if strings.TrimSpace(in.PlanID) != "" {
+		if !IsSafePlanID(in.PlanID) {
+			return zero, notFound("test plan not found")
+		}
+		p, err := loadPlan(tx, in.PlanID, true)
+		if err != nil {
+			return zero, err
+		}
+		if p.AppID != app.ID {
+			return zero, badRequest("plan does not belong to app")
+		}
+		if p.Archived {
+			return zero, badRequest("plan is archived")
+		}
+		plan = &p
+	}
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		if plan != nil {
+			title = plan.Title
+		} else {
+			title = "Exploratory run"
+		}
+	}
+	if len(title) > maxTitleLen {
+		return zero, badRequest("title too long")
+	}
+	env := map[string]any{}
+	if plan != nil {
+		for k, v := range plan.Env {
+			env[k] = v
+		}
+	}
+	for k, v := range in.Env {
+		env[k] = v
+	}
+	if strings.TrimSpace(in.AccountLabel) != "" {
+		acc, ok := findTestAccount(app.TestAccounts, in.AccountLabel)
+		if !ok {
+			return zero, badRequest("unknown account_label")
+		}
+		env["account"] = map[string]any{
+			"label": acc.Label, "username": acc.Username,
+			"environment": acc.Environment, "secret_ref": acc.SecretRef,
+		}
+	}
+	envJSON, err := marshalEnv(env)
+	if err != nil {
+		return zero, err
+	}
+	refs, err := normalizeRefs(app, in.Refs)
+	if err != nil {
+		return zero, err
+	}
+	refsJSON, err := json.Marshal(refs)
+	if err != nil {
+		return zero, err
+	}
+	var planID any
+	var planVersion any
+	if plan != nil {
+		planID = plan.ID
+		planVersion = plan.Version
+	}
+	return preparedRun{
+		appID: app.ID, planID: planID, planVersion: planVersion, title: title,
+		executor: executor, executedBy: executedBy, env: env, envJSON: envJSON,
+		refs: refs, refsJSON: string(refsJSON),
+	}, nil
 }
 
 // GetRun returns one run and its steps, both read in one transaction.
@@ -808,7 +886,9 @@ func FinishRun(sqlDB *sql.DB, runID string) (TestRun, error) {
 	return out, err
 }
 
-// AbandonRun moves in_progress or awaiting_review to abandoned.
+// AbandonRun moves queued, in_progress, or awaiting_review to abandoned.
+// A queued dd-job run whose job is not live can be closed here. The API
+// still returns 409 when that job is queued or running.
 func AbandonRun(sqlDB *sql.DB, runID string) (TestRun, error) {
 	var out TestRun
 	err := withTx(sqlDB, func(tx *sql.Tx) error {
@@ -816,7 +896,7 @@ func AbandonRun(sqlDB *sql.DB, runID string) (TestRun, error) {
 		if err != nil {
 			return err
 		}
-		if run.Status != "in_progress" && run.Status != "awaiting_review" {
+		if run.Status != "queued" && run.Status != "in_progress" && run.Status != "awaiting_review" {
 			return conflictErr("run cannot be abandoned")
 		}
 		ts := db.NowIso()

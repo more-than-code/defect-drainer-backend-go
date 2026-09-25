@@ -18,6 +18,11 @@ import (
 	"github.com/joe/defect-drainer-go/internal/store"
 )
 
+func isJobConflict(err error) bool {
+	var c *jobs.ConflictError
+	return errors.As(err, &c)
+}
+
 func (a *App) postApp(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	if err := httpx.DecodeJSON(r, jsonBodyLimit, &body); err != nil && !errors.Is(err, io.EOF) {
@@ -808,6 +813,8 @@ func (a *App) restartBatchJob(w http.ResponseWriter, r *http.Request, resume boo
 		switch {
 		case errors.Is(err, jobs.ErrJobLive):
 			code = http.StatusConflict
+		case isJobConflict(err):
+			code = http.StatusConflict
 		case strings.Contains(err.Error(), "not found"):
 			code = http.StatusNotFound
 		}
@@ -821,7 +828,9 @@ func (a *App) shipPreview(w http.ResponseWriter, r *http.Request) {
 	preview, err := a.Batches.ShipPreview(r.PathValue("id"))
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "not found") {
+		if isJobConflict(err) {
+			code = http.StatusConflict
+		} else if strings.Contains(err.Error(), "not found") {
 			code = http.StatusNotFound
 		}
 		httpx.WriteError(w, code, err.Error())
@@ -849,7 +858,9 @@ func (a *App) createPRs(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "not found") {
+		if isJobConflict(err) {
+			code = http.StatusConflict
+		} else if strings.Contains(err.Error(), "not found") {
 			code = http.StatusNotFound
 		}
 		httpx.WriteError(w, code, err.Error())
@@ -863,7 +874,9 @@ func (a *App) refreshPRs(w http.ResponseWriter, r *http.Request) {
 	j, err := a.Batches.RefreshPRs(r.PathValue("id"))
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "not found") {
+		if isJobConflict(err) {
+			code = http.StatusConflict
+		} else if strings.Contains(err.Error(), "not found") {
 			code = http.StatusNotFound
 		}
 		httpx.WriteError(w, code, err.Error())

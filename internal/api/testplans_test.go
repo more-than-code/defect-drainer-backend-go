@@ -173,7 +173,7 @@ func TestTestPlanAndRunAPI(t *testing.T) {
 
 	if rec := doJSON(t, h, http.MethodPost, "/api/test-runs", map[string]any{
 		"app_id": appID, "plan_id": planID, "execute": "agent",
-	}); rec.Code != 400 || !strings.Contains(rec.Body.String(), "execute=agent is not available yet") {
+	}); rec.Code != 400 || !strings.Contains(rec.Body.String(), "no product repos resolved for worktrees") {
 		t.Fatalf("agent %d %s", rec.Code, rec.Body)
 	}
 	if rec := doJSON(t, h, http.MethodPost, "/api/test-runs", map[string]any{

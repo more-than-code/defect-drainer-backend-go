@@ -223,6 +223,10 @@ func (a *App) postTestRun(w http.ResponseWriter, r *http.Request) {
 		writeOpErr(w, err)
 		return
 	}
+	if asString(body["execute"]) == "agent" {
+		a.postAgentTestRun(w, body, env, refs)
+		return
+	}
 	run, err := store.CreateRun(a.DB, store.CreateRunInput{
 		AppID: asString(body["app_id"]), PlanID: asString(body["plan_id"]), Title: asString(body["title"]),
 		Execute: asString(body["execute"]), Executor: asString(body["executor"]), ExecutedBy: asString(body["executed_by"]),
@@ -245,6 +249,10 @@ func (a *App) getTestRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) deleteTestRun(w http.ResponseWriter, r *http.Request) {
+	if err := a.liveRunConflict(r.PathValue("id")); err != nil {
+		writeOpErr(w, err)
+		return
+	}
 	if err := store.DeleteRun(a.Store, r.PathValue("id"), r.URL.Query().Get("evidence") == "1"); err != nil {
 		writeOpErr(w, err)
 		return
@@ -255,6 +263,10 @@ func (a *App) deleteTestRun(w http.ResponseWriter, r *http.Request) {
 func (a *App) postTestRunStep(w http.ResponseWriter, r *http.Request) {
 	body, ok := decodeObject(w, r)
 	if !ok {
+		return
+	}
+	if err := a.liveRunConflict(r.PathValue("id")); err != nil {
+		writeOpErr(w, err)
 		return
 	}
 	run, err := store.AppendRunStep(a.DB, r.PathValue("id"), store.PlanStepIn{
@@ -282,6 +294,10 @@ func (a *App) patchTestRunStep(w http.ResponseWriter, r *http.Request) {
 		s := asString(body["actual"])
 		actual = &s
 	}
+	if err := a.liveRunConflict(r.PathValue("id")); err != nil {
+		writeOpErr(w, err)
+		return
+	}
 	run, err := store.PatchRunStep(a.DB, r.PathValue("id"), r.PathValue("key"), status, actual)
 	if err != nil {
 		writeOpErr(w, err)
@@ -291,6 +307,10 @@ func (a *App) patchTestRunStep(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) postTestRunStepEvidence(w http.ResponseWriter, r *http.Request) {
+	if err := a.liveRunConflict(r.PathValue("id")); err != nil {
+		writeOpErr(w, err)
+		return
+	}
 	if err := r.ParseMultipartForm(maxMultipartMem); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -332,6 +352,10 @@ func (a *App) postTestRunStepEvidence(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) finishTestRun(w http.ResponseWriter, r *http.Request) {
+	if err := a.liveRunConflict(r.PathValue("id")); err != nil {
+		writeOpErr(w, err)
+		return
+	}
 	run, err := store.FinishRun(a.DB, r.PathValue("id"))
 	if err != nil {
 		writeOpErr(w, err)
@@ -341,6 +365,10 @@ func (a *App) finishTestRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) abandonTestRun(w http.ResponseWriter, r *http.Request) {
+	if err := a.liveRunConflict(r.PathValue("id")); err != nil {
+		writeOpErr(w, err)
+		return
+	}
 	run, err := store.AbandonRun(a.DB, r.PathValue("id"))
 	if err != nil {
 		writeOpErr(w, err)

@@ -220,7 +220,7 @@ func (b *BatchRunner) failSimJob(jobID, msg string) {
 	batchID := j.BatchID
 	b.mu.Unlock()
 	b.MarkFailed(jobID, batchID, msg)
-	if cur := b.GetJob(jobID); cur != nil && cur.Status == "failed" {
+	if cur := b.GetJob(jobID); cur != nil && cur.Status == "failed" && !cur.isTestRun() {
 		b.SyncBatchAndDefects(cur, "failed")
 	}
 }

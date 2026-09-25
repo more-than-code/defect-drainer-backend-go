@@ -177,6 +177,9 @@ func validKey(k string) bool {
 	return keyRe.MatchString(k) && !strings.Contains(k, "..")
 }
 
+// ValidStepKey reports whether k is a plan or run step key.
+func ValidStepKey(k string) bool { return validKey(k) }
+
 func trimLimit(name, v string, max int, required bool) (string, error) {
 	v = strings.TrimSpace(v)
 	if required && v == "" {

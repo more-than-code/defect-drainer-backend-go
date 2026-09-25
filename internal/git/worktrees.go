@@ -31,6 +31,8 @@ type WorktreeRequest struct {
 	Source     string
 	Remote     string
 	Branch     string
+	// Ref is set only for a test-run checkout. Fix jobs leave it empty.
+	Ref string
 }
 
 func gitC(dir string, args ...string) error {
@@ -73,6 +75,10 @@ func CreateBatchWorktrees(batchID, worktreesRoot string, repos map[string]Worktr
 	var bindings []WorktreeBinding
 	for _, repo := range names {
 		req := repos[repo]
+		if _, err := worktreeDir(worktreesRoot, repo); err != nil {
+			RemoveBatchWorktrees(bindings)
+			return nil, err
+		}
 		primaryAbs, err := filepath.Abs(req.PrimaryAbs)
 		if err != nil {
 			RemoveBatchWorktrees(bindings)
@@ -95,7 +101,11 @@ func CreateBatchWorktrees(batchID, worktreesRoot string, repos map[string]Worktr
 			RemoveBatchWorktrees(bindings)
 			return nil, fmt.Errorf("%s: %w", repo, err)
 		}
-		worktreeAbs := filepath.Join(worktreesRoot, repo)
+		worktreeAbs, err := worktreeDir(worktreesRoot, repo)
+		if err != nil {
+			RemoveBatchWorktrees(bindings)
+			return nil, err
+		}
 		if _, err := os.Stat(worktreeAbs); err == nil {
 			_ = gitC(primaryAbs, "worktree", "remove", "--force", worktreeAbs)
 			_ = os.RemoveAll(worktreeAbs)
@@ -117,10 +127,15 @@ func CreateBatchWorktrees(batchID, worktreesRoot string, repos map[string]Worktr
 // RemoveBatchWorktrees is best-effort cleanup.
 func RemoveBatchWorktrees(bindings []WorktreeBinding) {
 	for _, b := range bindings {
+		if !confinedWorktree(b) {
+			continue
+		}
 		_ = gitC(b.PrimaryAbs, "worktree", "remove", "--force", b.WorktreeAbs)
 		_ = os.RemoveAll(b.WorktreeAbs)
 		_ = gitC(b.PrimaryAbs, "worktree", "prune")
-		_ = gitC(b.PrimaryAbs, "branch", "-D", b.Branch)
+		if b.Branch != "" {
+			_ = gitC(b.PrimaryAbs, "branch", "-D", b.Branch)
+		}
 	}
 }
 

@@ -35,6 +35,7 @@ type Job struct {
 	AppID        string                `json:"app_id,omitempty"`
 	DefectID     string                `json:"defectId,omitempty"`
 	BatchID      string                `json:"batchId,omitempty"`
+	TestRunID    string                `json:"testRunId,omitempty"`
 	DefectIDs    []string              `json:"defect_ids,omitempty"`
 	Repos        []string              `json:"repos,omitempty"`
 	Error        string                `json:"error,omitempty"`
@@ -70,7 +71,7 @@ type Job struct {
 var jobOwnedJSON = map[string]bool{
 	"jobId": true, "id": true,
 	"kind": true, "status": true, "mode": true, "app_id": true,
-	"defectId": true, "batchId": true, "defect_ids": true, "repos": true,
+	"defectId": true, "batchId": true, "testRunId": true, "defect_ids": true, "repos": true,
 	"error": true, "handoffPath": true, "createdAt": true, "updatedAt": true,
 	"comment": true, "reporter": true, "prs": true, "worktrees": true,
 	"verification": true, "baseline": true, "diffHygiene": true,
@@ -135,6 +136,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		AppID        string                `json:"app_id,omitempty"`
 		DefectID     string                `json:"defectId,omitempty"`
 		BatchID      string                `json:"batchId,omitempty"`
+		TestRunID    string                `json:"testRunId,omitempty"`
 		DefectIDs    []string              `json:"defect_ids,omitempty"`
 		Repos        []string              `json:"repos,omitempty"`
 		Error        string                `json:"error,omitempty"`
@@ -166,7 +168,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 	}
 	b, err := json.Marshal(wire{
 		ID: j.ID, Kind: j.Kind, Status: j.Status, Mode: j.Mode, AppID: j.AppID,
-		DefectID: j.DefectID, BatchID: j.BatchID, DefectIDs: j.DefectIDs,
+		DefectID: j.DefectID, BatchID: j.BatchID, TestRunID: j.TestRunID, DefectIDs: j.DefectIDs,
 		Repos: j.Repos, Error: j.Error, HandoffPath: j.HandoffPath,
 		CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt, Comment: j.Comment,
 		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees,
@@ -787,6 +789,9 @@ type BatchRunner struct {
 	simHolder   string
 	simQueue    []simWaiter
 	defectsRoot string
+	// secrets holds a test-account password for the life of that job's agent
+	// loop. It is never persisted.
+	secrets map[string]string
 }
 
 // NewBatchRunner hydrates batch-jobs. A running job is failed as interrupted
@@ -799,6 +804,7 @@ func NewBatchRunner(st *store.Store, dataRoot string) *BatchRunner {
 		procs:        map[string]*spawnedProc{},
 		persist:      map[string]*sync.Mutex{},
 		verifyCancel: map[string]*verifyCancelSlot{},
+		secrets:      map[string]string{},
 	}
 	_ = os.MkdirAll(paths.BatchJobsDir(dataRoot), 0o755)
 	b.hydrate()
@@ -1216,7 +1222,7 @@ func (b *BatchRunner) MarkFailed(jobID, batchID, msg string) {
 	}
 	b.mu.Unlock()
 	b.persistLive(jobID)
-	if b.store != nil {
+	if b.store != nil && batchID != "" {
 		_, _ = b.store.DB.Exec(`UPDATE batches SET status = ?, updated_at = ? WHERE id = ?`, "failed", db.NowIso(), batchID)
 	}
 }
@@ -1248,6 +1254,11 @@ func (b *BatchRunner) appendLogLocked(j *Job, line, level, source string) {
 	}
 	if source == "" {
 		source = "DefectDrainer"
+	}
+	if b.secrets != nil {
+		if secret := b.secrets[j.ID]; secret != "" {
+			line = strings.ReplaceAll(line, secret, "[redacted]")
+		}
 	}
 	j.Log = append(j.Log, fmt.Sprintf("[%s] [%s] %s", level, source, line))
 	if len(j.Log) > jobLogCap {
@@ -1675,6 +1686,10 @@ func (b *BatchRunner) WriteFailClosedBrief(job *Job, defectsRoot string) {
 	if job == nil {
 		return
 	}
+	if job.isTestRun() {
+		_ = b.writeTestHandoff(job, filepath.Join(paths.BatchJobsDir(b.dataRoot), job.ID), job.Error)
+		return
+	}
 	handoff := filepath.Join(paths.BatchJobsDir(b.dataRoot), job.ID)
 	cp := *job
 	cp.Worktrees = nil
@@ -1810,6 +1825,11 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	batchID := j.BatchID
 	appID := j.AppID
 	jobCopy := *j
+	strat := strategyFor(&jobCopy)
+	label := batchID
+	if jobCopy.isTestRun() {
+		label = jobLabel(&jobCopy)
+	}
 	done := make(chan struct{})
 	if b.starting == nil {
 		b.starting = map[string]chan struct{}{}
@@ -1825,6 +1845,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	queuedHere := false
 	defer func() {
 		if !launched {
+			b.clearSecret(jobID)
 			if queuedHere {
 				b.dropOwnVerifyCancel(jobID, token, cancel)
 			} else {
@@ -1844,7 +1865,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 		startSpawnHook()
 	}
 
-	if err := b.writeSpawnBrief(&jobCopy, defectsRoot, handoff); err != nil {
+	if err := strat.writeHandoff(b, &jobCopy, defectsRoot, handoff); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -1876,13 +1897,19 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 		verifyCommands = store.NormalizeVerifyCommands(app.VerifyCommands)
 		repoEntries = app.RepoEntries
 	}
-	_ = os.MkdirAll(filepath.Join(handoff, "fix-evidence"), 0o755)
-	_ = os.MkdirAll(filepath.Join(handoff, "fix-notes"), 0o755)
+	strat.prepare(handoff)
 	turnsNote := "default"
 	if maxTurns > 0 {
 		turnsNote = strconv.Itoa(maxTurns)
 	}
 	b.appendLog(&jobCopy, fmt.Sprintf("app %s grok_sandbox=%s agent_toolchain=%s agent_max_turns=%s", appID, sandbox, toolchainKind, turnsNote), "info", "DefectDrainer")
+
+	// Fail closed: a store error is not "no secret names". Baseline and the
+	// toolchain probe use this list, so it is resolved before either runs.
+	stripNames, stripErr := b.secretEnvNames()
+	if stripErr != nil {
+		return stripErr
+	}
 
 	// One lease for the whole host, shared by every app that writes to the
 	// booted simulator. Apps without the flag never wait.
@@ -1899,14 +1926,14 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	}
 	provisioned := NO_TOOLCHAIN
 	if toolchainKind == "flutter" {
-		provisioned = provisionFlutterToolchain(handoff, wts, spawnLog)
+		provisioned = provisionFlutterToolchain(handoff, wts, spawnLog, stripNames)
 	}
 
 	var sandboxProfile string
 	var profileBody []byte
 	var profileNotes []string
 	if simWrites {
-		profile, err := writeSimulatorSandboxProfile(handoff, sandbox, batchID)
+		profile, err := writeSimulatorSandboxProfile(handoff, sandbox, label)
 		if err != nil {
 			spawnLog("sandbox: job profile failed — skipped ("+err.Error()+")", "warn")
 		} else {
@@ -1928,26 +1955,28 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	realByRepo := snapshotWorktreeReals(wts)
 
 	var baseline *VerificationRun
-	if mode != spawnFresh {
-		baseline = jobCopy.Baseline
-		if baseline != nil {
-			spawnLog("baseline: reusing the first run's (measured before any agent edits)", "info")
-		} else if len(verifyCommands) > 0 {
-			spawnLog("baseline: none stored — skipped; verify judges without one, so every red command blocks", "warn")
-		}
-	} else if len(verifyCommands) > 0 {
-		run := runVerification(ctx, verifyCommands, wts, filepath.Join(handoff, "baseline"), repoEntries, provisioned.VerifyEnv, realByRepo, func(line, level string) {
-			spawnLog("baseline "+line, level)
-		})
-		baseline = &run
-		if run.Ran {
-			b.mu.Lock()
-			if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
-				live.Baseline = baseline
-				b.appendLogLocked(live, "baseline: "+summarizeVerification(run), "info", "DefectDrainer")
+	if strat.verifies() {
+		if mode != spawnFresh {
+			baseline = jobCopy.Baseline
+			if baseline != nil {
+				spawnLog("baseline: reusing the first run's (measured before any agent edits)", "info")
+			} else if len(verifyCommands) > 0 {
+				spawnLog("baseline: none stored — skipped; verify judges without one, so every red command blocks", "warn")
 			}
-			b.mu.Unlock()
-			b.persistLive(jobID)
+		} else if len(verifyCommands) > 0 {
+			run := runVerification(ctx, verifyCommands, wts, filepath.Join(handoff, "baseline"), repoEntries, provisioned.VerifyEnv, realByRepo, func(line, level string) {
+				spawnLog("baseline "+line, level)
+			}, stripNames)
+			baseline = &run
+			if run.Ran {
+				b.mu.Lock()
+				if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
+					live.Baseline = baseline
+					b.appendLogLocked(live, "baseline: "+summarizeVerification(run), "info", "DefectDrainer")
+				}
+				b.mu.Unlock()
+				b.persistLive(jobID)
+			}
 		}
 	}
 
@@ -1984,6 +2013,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	}
 	// Every iteration uses identical argv except for -c + the continue prompt,
 	// so the sandbox and turn budget cannot drift between them.
+	var secret string
 	startIter := func(resume bool, session string) (*exec.Cmd, func(), error) {
 		// The previous iteration ran with this handoff as its writable cwd,
 		// and grok re-reads the profile on every start.
@@ -1992,8 +2022,16 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 				return nil, nil, err
 			}
 		}
-		return git.StartCodingAgent(handoff, batchID, defectsRoot, wts, sandbox, onStdout, onStderr, &git.CodingAgentOpts{
-			ExtraEnv:       provisioned.Env,
+		names, nerr := b.secretEnvNames()
+		if nerr != nil {
+			return nil, nil, nerr
+		}
+		extra := map[string]string{}
+		for k, v := range provisioned.Env {
+			extra[k] = v
+		}
+		opts := &git.CodingAgentOpts{
+			ExtraEnv:       extra,
 			SandboxProfile: sandboxProfile,
 			ToolchainNotes: notes,
 			VerifyCommands: verifySpecs,
@@ -2001,11 +2039,33 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 			MaxTurns:       maxTurns,
 			Continue:       resume,
 			ResumeSession:  session,
+			StripEnv:       names,
 			OnEnd: func(e git.AgentEnd) {
 				acc.end(e.StopReason, e.SessionID, e.NumTurns, e.TotalCostUSD)
 			},
 			OnMaxTurns: acc.maxTurnsReached,
-		})
+		}
+		if prompt, cont := strat.prompts(b, &jobCopy, handoff, defectsRoot, sandbox, wts, opts); prompt != "" || cont != "" {
+			opts.Prompt = prompt
+			opts.ContinuePrompt = cont
+		}
+		if !strat.verifies() {
+			opts.VerifyCommands = nil
+			opts.AlreadyFailing = nil
+		}
+		if secret != "" {
+			opts.Secret = secret
+			opts.ExtraEnv["DD_TEST_ACCOUNT_PASSWORD"] = secret
+		}
+		return git.StartCodingAgent(handoff, label, defectsRoot, wts, sandbox, onStdout, onStderr, opts)
+	}
+	var serr error
+	secret, serr = b.readTestSecret(&jobCopy)
+	if serr != nil {
+		return bail(Conflict(serr.Error()))
+	}
+	if secret != "" {
+		b.setSecret(jobID, secret)
 	}
 	// Running hits disk before the child exists. A kill after this rename
 	// hydrates as interrupted; a kill before it leaves queued and no process.
@@ -2020,15 +2080,29 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	if live.DiffBase == nil {
 		live.DiffBase = diffBaseByRepo
 	}
-	b.appendLogLocked(live, fmt.Sprintf(
+	spawnLine := fmt.Sprintf(
 		"spawning batch fix: %s — %s sandbox=%s cwd=%s (%d worktree(s))",
 		bin, batchID, sandbox, handoff, len(wts),
-	), "info", "DefectDrainer")
+	)
+	if jobCopy.isTestRun() {
+		spawnLine = fmt.Sprintf(
+			"spawning test run: %s — %s sandbox=%s cwd=%s (%d worktree(s))",
+			bin, label, sandbox, handoff, len(wts),
+		)
+	}
+	b.appendLogLocked(live, spawnLine, "info", "DefectDrainer")
 	for _, w := range wts {
-		b.appendLogLocked(live, fmt.Sprintf("worktree %s → %s (%s)", w.Repo, w.WorktreeAbs, w.Branch), "info", "DefectDrainer")
+		if w.Branch != "" {
+			b.appendLogLocked(live, fmt.Sprintf("worktree %s → %s (%s)", w.Repo, w.WorktreeAbs, w.Branch), "info", "DefectDrainer")
+		} else {
+			b.appendLogLocked(live, fmt.Sprintf("worktree %s → %s (detached %s)", w.Repo, w.WorktreeAbs, diffBaseByRepo[w.Repo]), "info", "DefectDrainer")
+		}
 	}
 	b.mu.Unlock()
 	if err := b.persistLive(jobID); err != nil {
+		return err
+	}
+	if err := b.markTestRunStarted(jobID); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -2041,6 +2115,17 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 	cmd, flush, err := startIter(false, resumeSession)
 	if err != nil {
 		return err
+	}
+	// Previous-run hygiene stays until this child exists. A sim-lease queue
+	// returns before startIter, and a failed start must not wipe it.
+	if jobCopy.isTestRun() {
+		b.mu.Lock()
+		if live := b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
+			live.Verification = nil
+			live.DiffHygiene = nil
+		}
+		b.mu.Unlock()
+		_ = b.persistLive(jobID)
 	}
 	// The wall clock starts here — at iter-1 Start, not at StartSpawn. Baseline
 	// is 20 min per command on its own clock and must not eat the agent budget.
@@ -2095,6 +2180,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 		}
 		defer func() {
 			endLoop()
+			b.clearSecret(jobID)
 			// Cancel before releasing driving: once it clears, a Restart may
 			// install the next run's cancel under the same id.
 			b.callVerifyCancel(jobID, token)
@@ -2129,7 +2215,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 				return
 			}
 
-			complete, miss := artifactsComplete(handoff, jobCopy.DefectIDs, sandbox, cutoff)
+			complete, miss := strat.complete(b, handoff, &jobCopy, sandbox, cutoff)
 			missing = miss
 			stoppedBy = nextLoopStop(iter, maxIters, time.Since(loopStart), maxWall, exitErr, sawMaxTurns, complete)
 
@@ -2193,66 +2279,33 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 			return
 		}
 		if failed {
-			live.Status = "failed"
 			live.Error = formatGrokExit(exitErr)
 			b.appendLogLocked(live, live.Error, "error", "DefectDrainer")
+			// Test jobs stay running through harvest so the K5 guards hold.
+			// Fix jobs still flip to failed before afterLoop.
+			if !live.isTestRun() {
+				live.Status = "failed"
+			}
 		} else {
 			live.Error = ""
 		}
+		testFailed := failed && live.isTestRun()
 		b.mu.Unlock()
 		b.persistLive(jobID)
-		if b.GetJob(jobID) == nil {
-			return
-		}
-		var harvestOpts *HarvestOpts
-		if !failed {
-			run := runVerification(ctx, verifyCommands, wts, handoff, repoEntries, provisioned.VerifyEnv, realByRepo, spawnLog)
-			hygiene := measureDiffHygiene(wts, diffBaseByRepo, spawnLog)
-			verdict := judgeVerification(&run, baseline)
-			level := "info"
-			if !verdict.Ok {
-				level = "warn"
-			}
+		strat.afterLoop(b, loopFinish{
+			jobID: jobID, handoff: handoff, failed: failed, ctx: ctx,
+			wts: wts, diffBase: diffBaseByRepo, verifyCmds: verifyCommands,
+			repoEntries: repoEntries, verifyEnv: provisioned.VerifyEnv,
+			stripEnv: stripNames, realByRepo: realByRepo, baseline: baseline, log: spawnLog,
+		})
+		if testFailed {
 			b.mu.Lock()
-			if live = b.jobs[jobID]; live != nil && !jobGoneOrCancelled(live) {
-				cp := run
-				live.Verification = &cp
-				h := hygiene
-				live.DiffHygiene = &h
-				if baseline != nil {
-					live.Baseline = baseline
-				}
-				b.appendLogLocked(live, "verify: "+summarizeVerdict(verdict), level, "DefectDrainer")
-				b.appendLogLocked(live, "Grok process exited OK — harvesting fix-evidence…", "info", "DefectDrainer")
+			if cur := b.jobs[jobID]; cur != nil && !jobGoneOrCancelled(cur) {
+				cur.Status = "failed"
 			}
 			b.mu.Unlock()
 			b.persistLive(jobID)
-			harvestOpts = &HarvestOpts{Verification: &run, AllowResolve: true}
 		}
-		if j := b.GetJob(jobID); j == nil || jobGoneOrCancelled(j) {
-			return
-		}
-		b.harvestFixEvidence(b.GetJob(jobID), handoff, harvestOpts)
-		live = b.GetJob(jobID)
-		if live == nil || jobGoneOrCancelled(live) {
-			return
-		}
-		if failed {
-			b.SyncBatchAndDefects(live, "failed")
-			return
-		}
-		b.mu.Lock()
-		if cur := b.jobs[jobID]; cur != nil && !jobGoneOrCancelled(cur) {
-			cur.Status = "completed"
-		}
-		b.mu.Unlock()
-		b.persistLive(jobID)
-		live = b.GetJob(jobID)
-		if live == nil || jobGoneOrCancelled(live) {
-			return
-		}
-		b.SyncBatchAndDefects(live, "complete")
-		b.appendLog(live, "batch complete — review worktrees; merge when satisfied", "info", "DefectDrainer")
 	}()
 	return nil
 }
@@ -2296,7 +2349,9 @@ func (b *BatchRunner) Stop(jobID string) (*Job, error) {
 			_ = slot.cmd.Process.Kill()
 		}()
 	}
-	b.SyncBatchAndDefects(j, "cancelled")
+	if !j.isTestRun() {
+		b.SyncBatchAndDefects(j, "cancelled")
+	}
 	return b.GetJob(jobID), nil
 }
 
@@ -2307,6 +2362,10 @@ func (b *BatchRunner) ShipPreview(jobID string) (git.ShipPreview, error) {
 	if j == nil {
 		b.mu.Unlock()
 		return git.ShipPreview{}, fmt.Errorf("job not found: %s", jobID)
+	}
+	if j.isTestRun() {
+		b.mu.Unlock()
+		return git.ShipPreview{}, Conflict("test run jobs do not ship")
 	}
 	wts := append([]git.WorktreeBinding(nil), j.Worktrees...)
 	batchID := j.BatchID
@@ -2336,6 +2395,10 @@ func (b *BatchRunner) CreatePRs(jobID string, ship git.ShipRequest) (*Job, error
 	if j == nil {
 		b.mu.Unlock()
 		return nil, fmt.Errorf("job not found: %s", jobID)
+	}
+	if j.isTestRun() {
+		b.mu.Unlock()
+		return nil, Conflict("test run jobs do not ship")
 	}
 	if j.Status == "running" || j.Status == "queued" {
 		b.mu.Unlock()
@@ -2388,6 +2451,10 @@ func (b *BatchRunner) RefreshPRs(jobID string) (*Job, error) {
 	if j == nil {
 		b.mu.Unlock()
 		return nil, fmt.Errorf("job not found: %s", jobID)
+	}
+	if j.isTestRun() {
+		b.mu.Unlock()
+		return nil, Conflict("test run jobs do not ship")
 	}
 	if len(j.PRs) == 0 {
 		b.mu.Unlock()

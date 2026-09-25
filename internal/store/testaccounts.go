@@ -72,8 +72,32 @@ func accountString(m map[string]any, key string) (string, error) {
 	return s, nil
 }
 
+// ReservedSecretEnv is true for env:NAME values that would clobber the
+// process environment or a Defect Drainer control variable.
+func ReservedSecretEnv(name string) bool {
+	switch name {
+	case "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "LANG", "TERM", "CI":
+		return true
+	}
+	for _, p := range []string{"LC_", "GROK_", "SKILL_FORGE_", "DEFECT_DRAINER_", "DEFECT_CHANNEL_", "DD_", "GIT_", "GH_"} {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ReservedSecretMessage is the 400 and the spawn refusal for a reserved name.
+func ReservedSecretMessage(name string) string {
+	return "secret_ref env:" + name + " is reserved; use a dedicated variable such as QA_PASSWORD"
+}
+
 // NormalizeTestAccounts trims fields and enforces label and secret_ref rules.
 func NormalizeTestAccounts(in []TestAccount) ([]TestAccount, error) {
+	return normalizeTestAccounts(in, true)
+}
+
+func normalizeTestAccounts(in []TestAccount, rejectReserved bool) ([]TestAccount, error) {
 	if len(in) == 0 {
 		return []TestAccount{}, nil
 	}
@@ -96,6 +120,12 @@ func NormalizeTestAccounts(in []TestAccount) ([]TestAccount, error) {
 		if strings.HasPrefix(ref, "env:") && !envSecretRefRe.MatchString(ref) {
 			return nil, badRequest("invalid secret_ref")
 		}
+		if rejectReserved && envSecretRefRe.MatchString(ref) {
+			name := strings.TrimPrefix(ref, "env:")
+			if ReservedSecretEnv(name) {
+				return nil, badRequest(ReservedSecretMessage(name))
+			}
+		}
 		out = append(out, TestAccount{
 			Label:       label,
 			Username:    strings.TrimSpace(a.Username),
@@ -106,6 +136,24 @@ func NormalizeTestAccounts(in []TestAccount) ([]TestAccount, error) {
 	return out, nil
 }
 
+// AccountEnvVar is the host variable named by env.account.secret_ref when
+// that reference is env:NAME. Free text and a missing account inject nothing.
+func AccountEnvVar(env map[string]any) (string, bool) {
+	if env == nil {
+		return "", false
+	}
+	acc, ok := env["account"].(map[string]any)
+	if !ok || acc == nil {
+		return "", false
+	}
+	ref, _ := acc["secret_ref"].(string)
+	ref = strings.TrimSpace(ref)
+	if !envSecretRefRe.MatchString(ref) {
+		return "", false
+	}
+	return strings.TrimPrefix(ref, "env:"), true
+}
+
 func parseStoredTestAccounts(raw string) []TestAccount {
 	if strings.TrimSpace(raw) == "" {
 		return []TestAccount{}
@@ -114,7 +162,9 @@ func parseStoredTestAccounts(raw string) []TestAccount {
 	if err := json.Unmarshal([]byte(raw), &v); err != nil || v == nil {
 		return []TestAccount{}
 	}
-	got, err := NormalizeTestAccounts(v)
+	// Load does not apply the reserved-name refusal. Rows saved before that
+	// check must still be visible so a spawn can refuse them.
+	got, err := normalizeTestAccounts(v, false)
 	if err != nil {
 		return []TestAccount{}
 	}

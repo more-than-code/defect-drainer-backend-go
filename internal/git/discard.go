@@ -148,6 +148,10 @@ func planOne(b WorktreeBinding, root string) WorktreeDiscard {
 		d.Reason = "not registered in " + b.PrimaryAbs + "; repo left alone"
 		return d
 	}
+	if strings.TrimSpace(b.Branch) == "" {
+		d.Reason = "detached worktree; no branch to delete"
+		return d
+	}
 	if !jobBranch.MatchString(b.Branch) {
 		d.Reason = "not a job branch; left alone"
 		return d
