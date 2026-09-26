@@ -3,8 +3,8 @@
   "registry": {
     "name": "skill-forge",
     "version": "1.3.0",
-    "commit": "fcde061035fcc4feaa88c9736bf1e2ff99700eae",
-    "lockIntegrity": "sha256-LkBLMRRaY3k+ngg3eYVfnNEu59q928W3TlxHOWY8K9Y="
+    "commit": "8b56ac231a31890f2cd97e4370619031cbeeba28",
+    "lockIntegrity": "sha256-iTFy0UhPjp1K8fFFb9NdtGBsMAswjanUusHmHWoYDh0="
   },
   "skills": {
     "api-contracts": {
@@ -43,8 +43,8 @@
       "source": "registry"
     },
     "grok-build-harness": {
-      "version": "0.5.1",
-      "integrity": "sha256-Y+MiuKuLTUJQAWJD/oDJ040jlZednMNVanx8V76HfAA=",
+      "version": "0.5.2",
+      "integrity": "sha256-PXn3JuAcT7vEOHSCpg6kXALkJfomhXsD53gxGfVKTwM=",
       "source": "registry"
     },
     "llm-integration": {

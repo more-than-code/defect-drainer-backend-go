@@ -176,8 +176,8 @@ disproves (below).
 |---------|---------|----------|---------------|------------------------------|-----|
 | `off` (default) | everywhere | everywhere | allowed | **writable** | no sandbox |
 | `workspace` | everywhere | CWD + temp + `~/.grok` | allowed | blocked only while outside CWD | default; recommended |
-| `read-only` | everywhere | temp + `~/.grok` | blocked (Linux only) | outside the write set (unprobed) | exploration/review |
-| `strict` | CWD + system paths + `~/.grok` | CWD + temp + `~/.grok/sessions` | blocked (Linux only) | outside the write set (unprobed) | untrusted code |
+| `read-only` | everywhere | temp + `~/.grok` | blocked (Linux only) | blocked (no CWD grant) | exploration/review |
+| `strict` | CWD + system paths + `~/.grok` | CWD + temp + `~/.grok/sessions` | blocked (Linux only) | blocked only while outside CWD | untrusted code |
 | `devbox` | everywhere | every top-level dir except `/data` | allowed | **writable** | disposable VMs only |
 
 "Temp" is `/tmp`, `/var/tmp` and the macOS temp dirs. Child-network blocking is
@@ -186,10 +186,13 @@ seccomp, so on macOS `read-only` and `strict` do not restrict it.
 **No profile protects credential paths by name.** `~/.ssh`, `~/.aws` and `~/.gnupg`
 are unwritable only when they fall outside the profile's write set. Probed on 1.0.41
 (2026-09-26) with a create-then-remove file: all three were writable under `off` and
-`devbox`. Under `workspace` they were blocked from a scratch CWD, but writable when
-CWD was `$HOME`, and a `read_write` grant that covers them would open them too. Grok's
-own credentials (`~/.grok/auth.json`) sit inside the `~/.grok` write grant and stayed
-writable under `workspace`. What Grok does write-deny is its config, trust, sandbox
+`devbox`. Under `workspace` and `strict` they were blocked from a scratch CWD, but
+writable when CWD was `$HOME`. Under `read-only`, which grants no CWD write, they were
+blocked. A `read_write` grant that covers them would open them under any profile.
+Grok's own credentials (`~/.grok/auth.json`) sit inside the `~/.grok` write grant, so
+they stayed writable under `workspace` and `read-only`. Only `strict`, which narrows
+that grant to `~/.grok/sessions`, blocked them, and only while CWD was elsewhere.
+What Grok does write-deny is its config, trust, sandbox
 and hook files (`config.toml`, `sandbox.toml`, `hooks/`, ...), and only under
 `workspace`, `read-only` and `strict`, not `devbox`. To guarantee a credential path is
 off-limits, list it under `deny` in a custom profile (below). That also blocks reads.
@@ -207,8 +210,9 @@ start at all (reproduced on 1.0.41: both exit 1 with the refusal, as does an unk
 name, while `off`, `workspace` and `devbox` start). The warning names the cause as
 "endpoint is a symlink", not a missing target. The reproducing host (2026-09-26) ran
 Podman, and its symlink was a dangling leftover pointing at a nonexistent
-`~/.docker/run/docker.sock`; no runtime used it. So the trigger is the link itself,
-whatever created it. Tools that install a Docker-compatible socket as a symlink
+`~/.docker/run/docker.sock`; no runtime used it. Removing that link was the whole
+fix: both profiles then started and enforced as documented. So the trigger is the link
+itself, whatever created it. Tools that install a Docker-compatible socket as a symlink
 (for example `podman-mac-helper`) would plausibly trip it on a working setup too;
 that case is unverified. Check with `ls -l /var/run/docker.sock`, and probe the
 profile you intend to use before writing a brief around it.
