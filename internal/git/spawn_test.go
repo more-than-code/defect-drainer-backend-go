@@ -274,14 +274,14 @@ func TestStartCodingAgentMarksWorkerRole(t *testing.T) {
 	if !strings.Contains(s, "ROLE=worker") {
 		t.Fatalf("child env missing SKILL_FORGE_AGENT_ROLE=worker:\n%s", s)
 	}
-	// The parent must not be mutated, and must never come out marked worker.
+	// The parent must not be mutated. That is the whole claim: this process is
+	// the test runner, not serve, and a worker running the suite is exactly the
+	// environment the delegation rules prescribe — so the ambient role says
+	// nothing about StartCodingAgent and must not be asserted on.
 	parentRoleAfter, parentRoleSetAfter := os.LookupEnv("SKILL_FORGE_AGENT_ROLE")
 	if parentRoleSetAfter != parentRoleSet || parentRoleAfter != parentRoleBefore {
 		t.Fatalf("StartCodingAgent mutated the parent role: before=%q(set=%v) after=%q(set=%v)",
 			parentRoleBefore, parentRoleSet, parentRoleAfter, parentRoleSetAfter)
-	}
-	if parentRoleAfter == "worker" {
-		t.Fatalf("the serve process is marked as a worker")
 	}
 	for _, want := range []string{
 		"ROLE (SKILL_FORGE_AGENT_ROLE=worker is set on this process)",
