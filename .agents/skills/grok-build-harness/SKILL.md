@@ -166,29 +166,52 @@ Rules for the loop:
 
 ## Gotcha 2 — the sandbox write boundary, and how to widen it
 
-Five built-in profiles on 1.0.40 and 1.0.41 (probed by name; the shipped README omits `devbox`):
+Five built-in profiles on 1.0.40 and 1.0.41 (probed by name). Take write sets from the
+bundled `~/.grok/docs/user-guide/18-sandbox.md`, not the shipped `~/.grok/README.md`:
+on 1.0.41 the README omits `devbox`, lists older write sets, and says `~/.ssh`,
+`~/.aws`, `~/.gnupg` are "always write-protected regardless of profile", which probing
+disproves (below).
 
-| Profile | FS read | FS write | Child network | Use |
-|---------|---------|----------|---------------|-----|
-| `off` (default) | everywhere | everywhere | allowed | no sandbox |
-| `workspace` | everywhere | CWD + `/tmp` + `~/.grok` | allowed | default; recommended |
-| `read-only` | everywhere | `~/.grok` only | blocked | exploration/review |
-| `strict` | CWD + system paths | CWD + `/tmp` + `~/.grok` | blocked | untrusted code |
-| `devbox` | broad | broad | allowed | disposable VMs only |
+| Profile | FS read | FS write | Child network | `~/.ssh` `~/.aws` `~/.gnupg` | Use |
+|---------|---------|----------|---------------|------------------------------|-----|
+| `off` (default) | everywhere | everywhere | allowed | **writable** | no sandbox |
+| `workspace` | everywhere | CWD + temp + `~/.grok` | allowed | blocked only while outside CWD | default; recommended |
+| `read-only` | everywhere | temp + `~/.grok` | blocked (Linux only) | outside the write set (unprobed) | exploration/review |
+| `strict` | CWD + system paths + `~/.grok` | CWD + temp + `~/.grok/sessions` | blocked (Linux only) | outside the write set (unprobed) | untrusted code |
+| `devbox` | everywhere | every top-level dir except `/data` | allowed | **writable** | disposable VMs only |
 
-`~/.ssh`, `~/.aws`, `~/.gnupg` and Grok's own credentials are write-protected under
-every profile. The sandbox is applied to the whole process at startup and is
-**irreversible** — the model cannot talk its way out of it at runtime.
+"Temp" is `/tmp`, `/var/tmp` and the macOS temp dirs. Child-network blocking is
+seccomp, so on macOS `read-only` and `strict` do not restrict it.
+
+**No profile protects credential paths by name.** `~/.ssh`, `~/.aws` and `~/.gnupg`
+are unwritable only when they fall outside the profile's write set. Probed on 1.0.41
+(2026-09-26) with a create-then-remove file: all three were writable under `off` and
+`devbox`. Under `workspace` they were blocked from a scratch CWD, but writable when
+CWD was `$HOME`, and a `read_write` grant that covers them would open them too. Grok's
+own credentials (`~/.grok/auth.json`) sit inside the `~/.grok` write grant and stayed
+writable under `workspace`. What Grok does write-deny is its config, trust, sandbox
+and hook files (`config.toml`, `sandbox.toml`, `hooks/`, ...), and only under
+`workspace`, `read-only` and `strict`, not `devbox`. To guarantee a credential path is
+off-limits, list it under `deny` in a custom profile (below). That also blocks reads.
+
+The sandbox is applied to the whole process at startup and is **irreversible**. The
+model cannot talk its way out of it at runtime.
 
 **It fails closed, not open.** An unknown profile name, or one whose rules cannot be
 resolved, prints a warning and *refuses to start*: "Refusing to start with its
 protections missing." (The README's "logs a warning and continues without
 enforcement" is stale.) One live instance of this: `read-only` and `strict` both
 carry a deny rule for the container runtime socket, and on a host where
-`/var/run/docker.sock` is a **symlink** — Docker Desktop, Colima, some Podman setups —
-resolution fails and neither profile will start at all (reproduced on 1.0.41: both
-exit 1 with the refusal, as does an unknown name, while `off`, `workspace` and `devbox`
-start). Probe the profile you intend to use before writing a brief around it.
+`/var/run/docker.sock` is a **symlink**, resolution fails and neither profile will
+start at all (reproduced on 1.0.41: both exit 1 with the refusal, as does an unknown
+name, while `off`, `workspace` and `devbox` start). The warning names the cause as
+"endpoint is a symlink", not a missing target. The reproducing host (2026-09-26) ran
+Podman, and its symlink was a dangling leftover pointing at a nonexistent
+`~/.docker/run/docker.sock`; no runtime used it. So the trigger is the link itself,
+whatever created it. Tools that install a Docker-compatible socket as a symlink
+(for example `podman-mac-helper`) would plausibly trip it on a working setup too;
+that case is unverified. Check with `ls -l /var/run/docker.sock`, and probe the
+profile you intend to use before writing a brief around it.
 
 **Custom profiles are the real fix for cache paths.** Define them in `~/.grok/sandbox.toml`
 (global) or `.grok/sandbox.toml` (per project) and pass the name to `--sandbox`:
