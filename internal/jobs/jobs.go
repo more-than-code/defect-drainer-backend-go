@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -50,6 +51,7 @@ type Job struct {
 	Baseline     *VerificationRun      `json:"baseline,omitempty"`
 	DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
 	AgentRun     *AgentRun             `json:"agentRun,omitempty"`
+	Review       *ReviewRun            `json:"review,omitempty"`
 	DiffBase     map[string]string     `json:"diffBase,omitempty"`     // worktree HEADs at first spawn; restarts measure hygiene from here
 	RunStartedAt string                `json:"runStartedAt,omitempty"` // latest Re-run/Resume; harvest imports only images newer than this
 	Harvests     []HarvestRun          `json:"harvests,omitempty"`     // one entry per harvest, oldest first; last 20 kept
@@ -75,7 +77,7 @@ var jobOwnedJSON = map[string]bool{
 	"error": true, "handoffPath": true, "createdAt": true, "updatedAt": true,
 	"comment": true, "reporter": true, "prs": true, "worktrees": true,
 	"verification": true, "baseline": true, "diffHygiene": true,
-	"agentRun": true, "diffBase": true, "runStartedAt": true, "harvests": true, "queuedAt": true, "queuedMode": true, "simQueue": true, "resumable": true, "rerunnable": true,
+	"agentRun": true, "review": true, "diffBase": true, "runStartedAt": true, "harvests": true, "queuedAt": true, "queuedMode": true, "simQueue": true, "resumable": true, "rerunnable": true,
 	"log": true, "source": true, "defectPath": true,
 	"severity": true, "client": true, "surface": true,
 }
@@ -151,6 +153,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		Baseline     *VerificationRun      `json:"baseline,omitempty"`
 		DiffHygiene  *DiffHygieneReport    `json:"diffHygiene,omitempty"`
 		AgentRun     *AgentRun             `json:"agentRun,omitempty"`
+		Review       *ReviewRun            `json:"review,omitempty"`
 		DiffBase     map[string]string     `json:"diffBase,omitempty"`
 		RunStartedAt string                `json:"runStartedAt,omitempty"`
 		Harvests     []HarvestRun          `json:"harvests,omitempty"`
@@ -173,7 +176,7 @@ func (j Job) MarshalJSON() ([]byte, error) {
 		CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt, Comment: j.Comment,
 		Reporter: j.Reporter, PRs: j.PRs, Worktrees: j.Worktrees,
 		Verification: j.Verification, Baseline: j.Baseline, DiffHygiene: j.DiffHygiene,
-		AgentRun: j.AgentRun, DiffBase: j.DiffBase, RunStartedAt: j.RunStartedAt,
+		AgentRun: j.AgentRun, Review: j.Review, DiffBase: j.DiffBase, RunStartedAt: j.RunStartedAt,
 		Harvests: j.Harvests,
 		QueuedAt: j.QueuedAt, QueuedMode: j.QueuedMode, SimQueue: j.SimQueue,
 		Resumable: j.Resumable, Rerunnable: j.Rerunnable,
@@ -412,6 +415,9 @@ func cloneJob(j *Job) *Job {
 			a.Missing = append([]string(nil), j.AgentRun.Missing...)
 		}
 		c.AgentRun = &a
+	}
+	if j.Review != nil {
+		c.Review = cloneReview(j.Review)
 	}
 	if j.DiffBase != nil {
 		c.DiffBase = make(map[string]string, len(j.DiffBase))
@@ -747,6 +753,22 @@ type spawnedProc struct {
 	cmd      *exec.Cmd
 	waitOnce sync.Once
 	waitErr  error
+	// group is set for a reviewer. Stop and Delete kill its process group.
+	// The implementer stays a normal process.
+	group bool
+}
+
+// kill stops a live child. A reviewer is a process-group leader; SIGKILL the
+// group so git and shell grandchildren die with it.
+func (p *spawnedProc) kill() {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	if p.group {
+		git.KillReviewProcess(p.cmd)
+		return
+	}
+	_ = p.cmd.Process.Kill()
 }
 
 func (p *spawnedProc) reap() error {
@@ -754,11 +776,50 @@ func (p *spawnedProc) reap() error {
 		return nil
 	}
 	p.waitOnce.Do(func() {
+		var pid int
+		if p.cmd != nil && p.cmd.Process != nil {
+			pid = p.cmd.Process.Pid
+		}
 		if p.cmd != nil {
 			p.waitErr = p.cmd.Wait()
+			// A background child keeps the stdout pipe open, so Wait reports
+			// ErrWaitDelay after the leader has already exited 0. That is not
+			// an implementer failure; the group kill below reaps the child.
+			if errors.Is(p.waitErr, exec.ErrWaitDelay) && p.cmd.ProcessState != nil && p.cmd.ProcessState.Success() {
+				p.waitErr = nil
+			}
+		}
+		// The reviewer's post-reap kill is suppressed (R12). The implementer's
+		// descendants are the ones that must not outlive this Wait.
+		if !p.group && pid > 0 {
+			git.KillImplementerGroup(pid)
 		}
 	})
 	return p.waitErr
+}
+
+// beginReview opens the DeleteJob gate for this job. Call it before the
+// manifest capture. The returned func closes the gate and is safe to call
+// twice; defer it so the after-review compare has finished on every return path.
+func (b *BatchRunner) beginReview(jobID string) func() {
+	ch := make(chan struct{})
+	b.mu.Lock()
+	if b.reviewing == nil {
+		b.reviewing = map[string]chan struct{}{}
+	}
+	b.reviewing[jobID] = ch
+	b.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.mu.Lock()
+			if b.reviewing[jobID] == ch {
+				delete(b.reviewing, jobID)
+			}
+			b.mu.Unlock()
+			close(ch)
+		})
+	}
 }
 
 // BatchRunner persists batches + batch-jobs.
@@ -772,6 +833,12 @@ type BatchRunner struct {
 	// procs[jobID] is empty, so Stop's signal is a no-op and DeleteJob would
 	// otherwise RemoveAll the handoff out from under the next child.
 	looping map[string]chan struct{}
+	// reviewing is open from just before the manifest capture until the
+	// after-review compare has finished. DeleteJob waits on it after killing
+	// the child. It is not looping: holding looping through review would
+	// deadlock a delete that lands during harvest, which runs after this
+	// channel is closed.
+	reviewing map[string]chan struct{}
 	// driving spans the whole driver goroutine, verify and harvest included.
 	// Stop can cancel a job mid-harvest; until this clears, a Restart would
 	// share the handoff with a goroutine that still writes the job and, on
@@ -1026,6 +1093,44 @@ func (b *BatchRunner) persistSlot(id string) *sync.Mutex {
 	return m
 }
 
+// finishTerminal writes status into job.json and only then publishes it on
+// the live job. logLine, when set, is part of that same write and is not
+// visible until the write returns. A client that observes the terminal
+// status is not racing a later rename of job.json. A cancelled or deleted
+// job is left as it is.
+func (b *BatchRunner) finishTerminal(id, status, logLine string) {
+	if id == "" || status == "" {
+		return
+	}
+	slot := b.persistSlot(id)
+	slot.Lock()
+	defer slot.Unlock()
+	b.mu.Lock()
+	live := b.jobs[id]
+	if live == nil || jobGoneOrCancelled(live) {
+		b.mu.Unlock()
+		return
+	}
+	snap := cloneJob(live)
+	if logLine != "" {
+		b.appendLogLocked(snap, logLine, "info", "DefectDrainer")
+	}
+	b.mu.Unlock()
+	snap.Status = status
+	snap.UpdatedAt = db.NowIso()
+	if err := writeJobSnapshot(filepath.Join(paths.BatchJobsDir(b.dataRoot), snap.ID), snap); err != nil {
+		fmt.Fprintf(os.Stderr, "defect-drainer: persist job %s: %v\n", id, err)
+	}
+	b.mu.Lock()
+	live = b.jobs[id]
+	if live != nil && !jobGoneOrCancelled(live) {
+		live.Status = status
+		live.UpdatedAt = snap.UpdatedAt
+		live.Log = snap.Log
+	}
+	b.mu.Unlock()
+}
+
 // persistLive is the one persist path per job: serialize writers, re-clone
 // the live map entry immediately before writing, stamp UpdatedAt on the live
 // job under b.mu (so GetJob matches job.json), then write off the mutex.
@@ -1071,12 +1176,15 @@ func (b *BatchRunner) DeleteJob(id string) ([]git.WorktreeDiscard, error) {
 	}
 	b.dequeueSimLocked(id)
 	slot := b.procs[id]
-	var startDone, loopDone chan struct{}
+	var startDone, loopDone, reviewDone chan struct{}
 	if b.starting != nil {
 		startDone = b.starting[id]
 	}
 	if b.looping != nil {
 		loopDone = b.looping[id]
+	}
+	if b.reviewing != nil {
+		reviewDone = b.reviewing[id]
 	}
 	delete(b.jobs, id)
 	delete(b.procs, id)
@@ -1089,8 +1197,8 @@ func (b *BatchRunner) DeleteJob(id string) ([]git.WorktreeDiscard, error) {
 	if cancel != nil {
 		cancel()
 	}
-	if slot != nil && slot.cmd != nil && slot.cmd.Process != nil {
-		_ = slot.cmd.Process.Kill()
+	if slot != nil {
+		slot.kill()
 	}
 	if slot != nil {
 		_ = slot.reap()
@@ -1102,6 +1210,11 @@ func (b *BatchRunner) DeleteJob(id string) ([]git.WorktreeDiscard, error) {
 	// for it to observe the deleted job and return before removing the dir.
 	if loopDone != nil {
 		<-loopDone
+	}
+	// After the child is dead, wait until the after-review compare has
+	// finished. Discarding the worktree first races that read.
+	if reviewDone != nil {
+		<-reviewDone
 	}
 	if b.store != nil {
 		analytics.DeleteJobSummary(b.store.DB, id)
@@ -1284,10 +1397,14 @@ func (b *BatchRunner) appendLog(j *Job, line, level, source string) {
 	b.persistLive(j.ID)
 }
 
-// HarvestOpts gates resolve on the post-fix verification run. Nil / ran==false
-// keeps evidence-only resolve (failed-agent harvest and jobs with no commands).
+// HarvestOpts gates resolve on the post-fix verification run and, when a
+// review was required, on that review. Nil opts cannot resolve.
 type HarvestOpts struct {
 	Verification *VerificationRun
+	// Review is the independent pass. Nil, or Required == false, does not
+	// gate resolve (failed, cancelled, or skipped). Required && !OK blocks
+	// resolve after evidence and notes are imported.
+	Review *ReviewRun
 	// AllowResolve must be set explicitly for a defect to resolve. The zero
 	// value denies: a failed, cancelled or capped run harvests its evidence and
 	// notes but resolves nothing, so nil opts can never resolve by accident.
@@ -1452,6 +1569,7 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 	cutoff := harvestCutoff(job)
 	imgCutoff := importCutoff(job)
 	recorded := []HarvestDefect{}
+	unfixed, notesUnreadable := notesForHarvest(handoff, job.DefectIDs, cutoff)
 
 	for _, defectID := range job.DefectIDs {
 		if !store.IsSafeID(defectID) {
@@ -1553,6 +1671,42 @@ func (b *BatchRunner) harvestFixEvidence(job *Job, handoff string, opts *Harvest
 		// the defect is not proof that this job fixed anything — accepting it
 		// is how a job with notes and a screenshot from a previous run used to
 		// resolve a defect it never touched.
+		// A required review that is not ok still keeps the images and the note,
+		// and resolves nothing. suggested_fix is not a command.
+		// UNFIXED is a full line in NOTES.md. DEF-1 must not decline DEF-10;
+		// notesMarkers matches the line exactly. A NOTES.md that exists but
+		// cannot be read is not an empty marker list: nothing in the job
+		// resolves, because a decline inside it would have been invisible.
+		if len(files) > 0 && allowResolve && notesUnreadable {
+			if note != "" {
+				_, _ = b.store.Update(defectID, store.DefectRecord{Resolution: note}, map[string]bool{"resolution": true})
+			}
+			why := "decline file could not be read"
+			b.appendLog(job, "harvest "+defectID+": NOT resolved — "+why, "warn", "DefectDrainer")
+			recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestNotResolved, Reason: why, Images: saved})
+			continue
+		}
+		if len(files) > 0 && allowResolve && unfixed[defectID] {
+			if note != "" {
+				_, _ = b.store.Update(defectID, store.DefectRecord{Resolution: note}, map[string]bool{"resolution": true})
+			}
+			why := "declined (UNFIXED)"
+			b.appendLog(job, "harvest "+defectID+": NOT resolved — "+why, "warn", "DefectDrainer")
+			recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestNotResolved, Reason: why, Images: saved})
+			continue
+		}
+		var reviewWhy string
+		if opts != nil {
+			reviewWhy = reviewBlockReason(opts.Review)
+		}
+		if len(files) > 0 && allowResolve && reviewWhy != "" {
+			if note != "" {
+				_, _ = b.store.Update(defectID, store.DefectRecord{Resolution: note}, map[string]bool{"resolution": true})
+			}
+			b.appendLog(job, "harvest "+defectID+": NOT resolved — "+reviewWhy, "warn", "DefectDrainer")
+			recorded = append(recorded, HarvestDefect{DefectID: defectID, Outcome: harvestReviewBlocked, Reason: reviewWhy, Images: saved})
+			continue
+		}
 		if len(files) > 0 && allowResolve {
 			res := note
 			if res == "" {
@@ -1751,6 +1905,12 @@ var (
 	harvestStartHook         func()
 	loopBeforeNextHook       func()
 	spawnExitHook            func()
+	// reviewLensStartedHook runs on the review goroutine after that lens's
+	// child is in procs and before Wait. DeleteJob reaps the child, so a hook
+	// that calls it has to do so from another goroutine.
+	reviewLensStartedHook func(lens string)
+	// reviewLensFinishedHook runs after that lens has been written to job.json.
+	reviewLensFinishedHook func(lens string)
 	// simLeaseQueuedHook runs after a job is queued and before that startSpawn
 	// returns, so a test can promote the waiter before the caller's defer.
 	simLeaseQueuedHook func()
@@ -1765,8 +1925,10 @@ func jobGoneOrCancelled(j *Job) bool {
 
 func abandonStartedAgent(cmd *exec.Cmd, flush func()) {
 	if cmd != nil && cmd.Process != nil {
+		pid := cmd.Process.Pid
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		git.KillImplementerGroup(pid)
 	}
 	if flush != nil {
 		flush()
@@ -1953,6 +2115,7 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 		}
 	}
 	realByRepo := snapshotWorktreeReals(wts)
+	gitDirByRepo := snapshotGitDirs(wts)
 
 	var baseline *VerificationRun
 	if strat.verifies() {
@@ -2279,32 +2442,24 @@ func (b *BatchRunner) startSpawn(jobID, defectsRoot string, mode spawnMode, resu
 			return
 		}
 		if failed {
+			// The error text is visible while the job is still running.
+			// Status stays running until finishTerminal, after afterLoop's
+			// last write: a client that sees failed is not racing job.json.
 			live.Error = formatGrokExit(exitErr)
 			b.appendLogLocked(live, live.Error, "error", "DefectDrainer")
-			// Test jobs stay running through harvest so the K5 guards hold.
-			// Fix jobs still flip to failed before afterLoop.
-			if !live.isTestRun() {
-				live.Status = "failed"
-			}
 		} else {
 			live.Error = ""
 		}
-		testFailed := failed && live.isTestRun()
 		b.mu.Unlock()
 		b.persistLive(jobID)
 		strat.afterLoop(b, loopFinish{
 			jobID: jobID, handoff: handoff, failed: failed, ctx: ctx,
 			wts: wts, diffBase: diffBaseByRepo, verifyCmds: verifyCommands,
 			repoEntries: repoEntries, verifyEnv: provisioned.VerifyEnv,
-			stripEnv: stripNames, realByRepo: realByRepo, baseline: baseline, log: spawnLog,
+			stripEnv: stripNames, realByRepo: realByRepo, gitDirByRepo: gitDirByRepo, baseline: baseline, log: spawnLog,
 		})
-		if testFailed {
-			b.mu.Lock()
-			if cur := b.jobs[jobID]; cur != nil && !jobGoneOrCancelled(cur) {
-				cur.Status = "failed"
-			}
-			b.mu.Unlock()
-			b.persistLive(jobID)
+		if failed {
+			b.finishTerminal(jobID, "failed", "")
 		}
 	}()
 	return nil
@@ -2342,7 +2497,9 @@ func (b *BatchRunner) Stop(jobID string) (*Job, error) {
 		cancel()
 	}
 	b.persistLive(jobID)
-	if slot != nil && slot.cmd != nil && slot.cmd.Process != nil {
+	if slot != nil && slot.group {
+		slot.kill()
+	} else if slot != nil && slot.cmd != nil && slot.cmd.Process != nil {
 		_ = slot.cmd.Process.Signal(os.Interrupt)
 		go func() {
 			time.Sleep(3 * time.Second)

@@ -24,19 +24,20 @@ type spawnStrategy interface {
 // loopFinish is what the driver loop hands the strategy once it has stopped
 // for a reason other than Stop or Delete.
 type loopFinish struct {
-	jobID       string
-	handoff     string
-	failed      bool
-	ctx         context.Context
-	wts         []git.WorktreeBinding
-	diffBase    map[string]string
-	verifyCmds  []store.VerifyCommand
-	repoEntries []store.AppRepoEntry
-	verifyEnv   map[string]string
-	stripEnv    []string
-	realByRepo  map[string]string
-	baseline    *VerificationRun
-	log         func(line, level string)
+	jobID        string
+	handoff      string
+	failed       bool
+	ctx          context.Context
+	wts          []git.WorktreeBinding
+	diffBase     map[string]string
+	verifyCmds   []store.VerifyCommand
+	repoEntries  []store.AppRepoEntry
+	verifyEnv    map[string]string
+	stripEnv     []string
+	realByRepo   map[string]string
+	gitDirByRepo map[string]string
+	baseline     *VerificationRun
+	log          func(line, level string)
 }
 
 func strategyFor(j *Job) spawnStrategy {
@@ -110,11 +111,23 @@ func (batchFixStrategy) afterLoop(b *BatchRunner, fin loopFinish) {
 				live.Baseline = fin.baseline
 			}
 			b.appendLogLocked(live, "verify: "+summarizeVerdict(verdict), level, "DefectDrainer")
-			b.appendLogLocked(live, "Grok process exited OK — harvesting fix-evidence…", "info", "DefectDrainer")
+			b.appendLogLocked(live, "Grok process exited OK — reviewing, then harvesting fix-evidence…", "info", "DefectDrainer")
 		}
 		b.mu.Unlock()
 		b.persistLive(fin.jobID)
 		harvestOpts = &HarvestOpts{Verification: &run, AllowResolve: true}
+	}
+	if j := b.GetJob(fin.jobID); j == nil || jobGoneOrCancelled(j) {
+		return
+	}
+	// Review sits between hygiene and harvest. A failed implementer records a
+	// skip and does not spawn. Test-run jobs use a different strategy.
+	rev, reviewStopped := b.runJobReview(fin)
+	if reviewStopped {
+		return
+	}
+	if harvestOpts != nil {
+		harvestOpts.Review = rev
 	}
 	if j := b.GetJob(fin.jobID); j == nil || jobGoneOrCancelled(j) {
 		return
@@ -125,19 +138,11 @@ func (batchFixStrategy) afterLoop(b *BatchRunner, fin loopFinish) {
 		return
 	}
 	if fin.failed {
+		// Status stays running. The driver publishes failed after this
+		// returns, which is the last job.json write.
 		b.SyncBatchAndDefects(live, "failed")
 		return
 	}
-	b.mu.Lock()
-	if cur := b.jobs[fin.jobID]; cur != nil && !jobGoneOrCancelled(cur) {
-		cur.Status = "completed"
-	}
-	b.mu.Unlock()
-	b.persistLive(fin.jobID)
-	live = b.GetJob(fin.jobID)
-	if live == nil || jobGoneOrCancelled(live) {
-		return
-	}
 	b.SyncBatchAndDefects(live, "complete")
-	b.appendLog(live, "batch complete — review worktrees; merge when satisfied", "info", "DefectDrainer")
+	b.finishTerminal(fin.jobID, "completed", "batch complete — review worktrees; merge when satisfied")
 }

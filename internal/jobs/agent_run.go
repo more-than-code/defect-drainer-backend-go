@@ -83,6 +83,21 @@ func notesMarkers(handoff string, defectIDs []string, cutoff time.Time) (unfixed
 	return unfixed, noShot, true
 }
 
+// notesForHarvest separates a missing NOTES.md from one the reader refuses.
+// Missing means no markers. Present but unreadable (too large, a symlink, a
+// hardlink, another device) must not look like an empty decline list.
+func notesForHarvest(handoff string, defectIDs []string, cutoff time.Time) (unfixed map[string]bool, unreadable bool) {
+	unfixed, _, ok := notesMarkers(handoff, defectIDs, cutoff)
+	if ok {
+		return unfixed, false
+	}
+	_, err := os.Lstat(filepath.Join(handoff, "NOTES.md"))
+	if os.IsNotExist(err) {
+		return unfixed, false
+	}
+	return unfixed, true
+}
+
 // harvestableImageName is the name-level half of harvest's evidence predicate.
 // Both harvestFixEvidence and artifactsComplete call it so the loop can never
 // stop on a file harvest would then skip. readRegularFile is the other half and

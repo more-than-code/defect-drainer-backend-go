@@ -896,24 +896,26 @@ exit 0
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
-	var resolved store.DefectRecord
+	var harvested store.DefectRecord
 	for time.Now().Before(deadline) {
 		d := doJSON(t, app.Handler, http.MethodGet, "/api/defects/"+fixedID, nil)
 		var wrap struct {
 			Defect store.DefectRecord `json:"defect"`
 		}
 		_ = json.Unmarshal(d.Body.Bytes(), &wrap)
-		if wrap.Defect.Status == "resolved" {
-			resolved = wrap.Defect
+		if len(wrap.Defect.FixEvidence) > 0 {
+			harvested = wrap.Defect
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if resolved.Status != "resolved" {
-		t.Fatalf("defect %s not resolved via StartSpawn harvest", fixedID)
+	// A screenshot of a tree that did not change is not a fix. Evidence still
+	// imports; the defect stays open (nothing to review).
+	if len(harvested.FixEvidence) == 0 {
+		t.Fatalf("defect %s evidence not imported via StartSpawn harvest", fixedID)
 	}
-	if len(resolved.FixEvidence) == 0 {
-		t.Fatal("resolved defect has no fix_evidence")
+	if harvested.Status == "resolved" {
+		t.Fatalf("defect %s resolved with no diff and no fix-notes", fixedID)
 	}
 	still := doJSON(t, app.Handler, http.MethodGet, "/api/defects/"+openID, nil)
 	var openWrap struct {
@@ -947,7 +949,7 @@ exit 0
 	if !strings.Contains(string(agentLog), "stdout-from-agent") {
 		t.Fatalf("agent.log missing stdout: %s", agentLog)
 	}
-	// The completion goroutine keeps writing job.json after the defect resolves
+	// The completion goroutine keeps writing job.json after harvest
 	// (batch sync, then a final log line). Returning before it finishes races
 	// t.TempDir cleanup, which fails the package with "directory not empty".
 	waitJobLogContains(t, app, batchOut.Job.ID, 5*time.Second, "batch complete")

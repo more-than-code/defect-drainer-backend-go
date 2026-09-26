@@ -148,15 +148,15 @@ func (testRunStrategy) afterLoop(b *BatchRunner, fin loopFinish) {
 	}
 	b.harvestTestRun(b.GetJob(fin.jobID), fin.handoff, !fin.failed)
 	if fin.failed {
+		// The driver publishes failed after afterLoop returns.
 		return
 	}
 	b.mu.Lock()
 	if cur := b.jobs[fin.jobID]; cur != nil && !jobGoneOrCancelled(cur) {
-		cur.Status = "completed"
 		cur.Error = ""
 	}
 	b.mu.Unlock()
-	b.persistLive(fin.jobID)
+	b.finishTerminal(fin.jobID, "completed", "")
 }
 
 func hygieneChanged(h DiffHygieneReport) bool {

@@ -14,12 +14,13 @@ import (
 )
 
 const (
-	harvestResolved    = "resolved"
-	harvestRegression  = "regression"
-	harvestNotResolved = "not_resolved"
-	harvestNotesOnly   = "notes_only"
-	harvestNoEvidence  = "no_evidence"
-	harvestError       = "error"
+	harvestResolved      = "resolved"
+	harvestRegression    = "regression"
+	harvestNotResolved   = "not_resolved"
+	harvestNotesOnly     = "notes_only"
+	harvestNoEvidence    = "no_evidence"
+	harvestError         = "error"
+	harvestReviewBlocked = "review_blocked"
 
 	harvestRunCap    = 20
 	harvestReasonMax = 500
@@ -48,7 +49,7 @@ var fixImageName = regexp.MustCompile(`^fix-[0-9]+\.(png|jpg|jpeg|webp|gif|heic)
 
 func knownHarvestOutcome(outcome string) bool {
 	switch outcome {
-	case harvestResolved, harvestRegression, harvestNotResolved, harvestNotesOnly, harvestNoEvidence, harvestError:
+	case harvestResolved, harvestRegression, harvestNotResolved, harvestNotesOnly, harvestNoEvidence, harvestError, harvestReviewBlocked:
 		return true
 	default:
 		return false

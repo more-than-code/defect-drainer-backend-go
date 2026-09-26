@@ -7,9 +7,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/joe/defect-drainer-go/internal/env"
@@ -309,7 +313,15 @@ type agentStream struct {
 	errs       *lineForwarder
 	onEnd      func(AgentEnd)
 	onMaxTurns func()
-	pend       []byte
+	// onText receives each text payload before it is split into log lines.
+	// Nil for the implementer. The reviewer reassembles findings from these
+	// chunks; the log forwarder is the wrong source because it cuts a line
+	// at maxLogBlock.
+	onText func(string)
+	// onTool receives tool_call and tool_call_update bodies. Nil for the
+	// implementer. The reviewer uses them as proof a worktree diff was read.
+	onTool func([]byte)
+	pend   []byte
 	// pendLimit caps a newline-less stdout blob. Zero keeps maxAgentLogBytes
 	// so production stays at 8 MiB; tests set a smaller value.
 	pendLimit int
@@ -387,7 +399,11 @@ func (a *agentStream) handle(line []byte) {
 	}
 	switch head.Type {
 	case "text":
-		a.appendText(textPayload(t))
+		payload := textPayload(t)
+		if a.onText != nil && payload != "" {
+			a.onText(payload)
+		}
+		a.appendText(payload)
 	case "end":
 		a.flushText()
 		var ev struct{ AgentEnd }
@@ -398,6 +414,12 @@ func (a *agentStream) handle(line []byte) {
 		if a.onEnd != nil {
 			a.onEnd(ev.AgentEnd)
 		}
+	case "tool_call", "tool_call_update":
+		if a.onTool != nil {
+			a.onTool(append([]byte(nil), t...))
+		}
+		// Same as the default: the body stays in agent.log, not the job log.
+		a.flushText()
 	case "max_turns_reached":
 		// The positive signal for turn exhaustion, which also exits non-zero.
 		a.flushText()
@@ -817,6 +839,13 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = handoffAbs
+	// Own process group so descendants die with the iteration. A background
+	// sleep or a swap loop otherwise outlives the exit and can still race
+	// the server's review git.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Descendants inherit the stdout pipe. After the leader exits, Wait must
+	// not block on them; the caller SIGKILLs the group once Wait returns.
+	cmd.WaitDelay = 100 * time.Millisecond
 	wtPaths := make([]string, 0, len(worktrees))
 	for _, w := range worktrees {
 		wtPaths = append(wtPaths, w.WorktreeAbs)
@@ -910,4 +939,269 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		return nil, nil, err
 	}
 	return cmd, flush, nil
+}
+
+// reviewTextLimit matches jobs.harvestFileLimit. A reviewer payload larger
+// than this is rejected whole; the cap here only keeps the collector from
+// growing without bound when the caller does not pass one.
+const reviewTextLimit = 26 << 20
+
+// ReviewAgentOpts is a fresh reviewer spawn. It never resumes a session.
+type ReviewAgentOpts struct {
+	Cwd      string
+	Prompt   string
+	MaxTurns int
+	// TextLimit caps the reassembled assistant text. <= 0 uses reviewTextLimit.
+	TextLimit int
+	// Wall is how long the child may run before it is killed. <= 0 disables
+	// the killer; the jobs orchestrator always passes a positive duration.
+	Wall     time.Duration
+	StripEnv []string
+	OnStdout func(string)
+	OnStderr func(string)
+	// Register runs after Start and before Wait so the caller can publish the
+	// process. The returned func is the single Wait — pass spawnedProc.reap,
+	// because Cmd.Wait must not run twice. Nil uses Cmd.Wait.
+	Register func(cmd *exec.Cmd) (wait func() error)
+}
+
+// ReviewResult is one reviewer process after it has exited. Text is every
+// streaming-json text payload concatenated, in order. Deadline is set when
+// Wall killed the child.
+type ReviewResult struct {
+	Text     string
+	End      AgentEnd
+	Stderr   string
+	TooLarge bool
+	Deadline bool
+	Err      error
+	// ToolEvents are the tool_call and tool_call_update payloads, in order.
+	ToolEvents [][]byte
+}
+
+// StartReviewAgent execs a reviewer that cannot resume the implementer.
+// Argv is built here and nowhere else: no -c, no -r, no --resume, sandbox
+// always read-only. The caller creates Cwd (handoff/review/<lens>, never the
+// handoff itself). Findings come back in ReviewResult.Text; this process
+// does not expect the child to write a file.
+func StartReviewAgent(opts ReviewAgentOpts) (ReviewResult, error) {
+	if opts.Cwd == "" {
+		return ReviewResult{}, fmt.Errorf("reviewer cwd is empty")
+	}
+	bin := ResolveGrokBin()
+	if bin == "" {
+		return ReviewResult{}, fmt.Errorf("coding agent binary not found")
+	}
+	maxTurns := opts.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = 8
+	}
+	limit := opts.TextLimit
+	if limit <= 0 {
+		limit = reviewTextLimit
+	}
+	prompt := opts.Prompt
+	if prompt == "" {
+		prompt = "Read REVIEW.md and reply with the findings JSON object it describes."
+	}
+	// Fresh process. Do not add -c, -r, --resume, or --always-approve.
+	// -c resumes the most recent session for this cwd. --always-approve
+	// would let a prompt injected into the implementer's diff read any file
+	// and exfiltrate it: read-only still reads everywhere, and the
+	// child-network block does not hold on macOS. The permission gate stays.
+	args := []string{
+		"-p", prompt,
+		"--cwd", opts.Cwd,
+		"--sandbox", "read-only",
+		"--no-subagents",
+		"--output-format", "streaming-json",
+		"--max-turns", strconv.Itoa(maxTurns),
+		"--verbatim",
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = opts.Cwd
+	// Own process group so a wall or Stop kill reaches git/shell grandchildren.
+	// The implementer spawn does not do this.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(filterInheritedEnv(os.Environ(), opts.StripEnv),
+		"CI=1",
+		"GROK_SANDBOX=read-only",
+		"SKILL_FORGE_AGENT_ROLE=worker",
+	)
+
+	var text strings.Builder
+	var stderr strings.Builder
+	var tools [][]byte
+	tooLarge := false
+	var end AgentEnd
+	outFwd := newLineForwarder(opts.OnStdout)
+	errFwd := newLineForwarder(func(line string) {
+		stderr.WriteString(line)
+		stderr.WriteByte('\n')
+		if opts.OnStderr != nil {
+			opts.OnStderr(line)
+		}
+	})
+	stream := &agentStream{text: outFwd, errs: errFwd}
+	stream.onText = func(s string) {
+		if tooLarge || s == "" {
+			return
+		}
+		if text.Len()+len(s) > limit {
+			tooLarge = true
+			return
+		}
+		text.WriteString(s)
+	}
+	stream.onEnd = func(e AgentEnd) { end = e }
+	stream.onTool = func(raw []byte) { tools = append(tools, raw) }
+
+	logf, logErr := os.OpenFile(filepath.Join(opts.Cwd, "agent.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if logErr == nil {
+		var start int64
+		if st, serr := logf.Stat(); serr == nil {
+			start = st.Size()
+		}
+		tee := &cappedWriter{w: logf, n: start, limit: maxAgentLogBytes}
+		stream.raw = tee
+		cmd.Stdout = stream
+		cmd.Stderr = io.MultiWriter(tee, errFwd)
+	} else {
+		cmd.Stdout = stream
+		cmd.Stderr = errFwd
+	}
+	flush := func() {
+		stream.Flush()
+		outFwd.Flush()
+		errFwd.Flush()
+		if logf != nil {
+			_ = logf.Close()
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		flush()
+		return ReviewResult{}, err
+	}
+	trackReviewProc(cmd)
+	defer forgetReviewProc(cmd)
+	wait := cmd.Wait
+	if opts.Register != nil {
+		if w := opts.Register(cmd); w != nil {
+			wait = w
+		}
+	}
+	var killed atomic.Bool
+	var timer *time.Timer
+	killedDone := make(chan struct{})
+	if opts.Wall > 0 {
+		timer = time.AfterFunc(opts.Wall, func() {
+			if KillReviewProcess(cmd) {
+				killed.Store(true)
+			}
+			close(killedDone)
+		})
+	}
+	waitErr := wait()
+	// The reaped flag is set before any late wall callback. A kill that
+	// loses the race with Wait must not signal a pid the kernel has reused.
+	markReviewReaped(cmd)
+	if reviewAfterReapHook != nil {
+		reviewAfterReapHook(cmd)
+	}
+	if timer != nil && !timer.Stop() {
+		<-killedDone
+	}
+	flush()
+	res := ReviewResult{
+		Text:       text.String(),
+		End:        end,
+		Stderr:     stderr.String(),
+		TooLarge:   tooLarge,
+		Err:        waitErr,
+		ToolEvents: tools,
+	}
+	if killed.Load() && waitErr != nil {
+		res.Deadline = true
+	}
+	return res, nil
+}
+
+// reviewProcGate is one reviewer's reap state. Kill paths share it so a
+// wall callback that runs after Wait does not signal a reused process group.
+type reviewProcGate struct {
+	mu     sync.Mutex
+	reaped bool
+}
+
+var reviewProcs sync.Map // *exec.Cmd -> *reviewProcGate
+
+// reviewAfterReapHook runs after Wait has returned and the reaped flag is
+// set. Tests use it to deliver the wall callback late.
+var reviewAfterReapHook func(cmd *exec.Cmd)
+
+// signalReviewGroup is the process-group SIGKILL. Tests replace it.
+var signalReviewGroup = func(pid int) error {
+	return syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+func trackReviewProc(cmd *exec.Cmd) {
+	reviewProcs.Store(cmd, &reviewProcGate{})
+}
+
+func forgetReviewProc(cmd *exec.Cmd) {
+	reviewProcs.Delete(cmd)
+}
+
+func markReviewReaped(cmd *exec.Cmd) {
+	v, ok := reviewProcs.Load(cmd)
+	if !ok {
+		return
+	}
+	st := v.(*reviewProcGate)
+	st.mu.Lock()
+	st.reaped = true
+	st.mu.Unlock()
+}
+
+// KillImplementerGroup SIGKILLs an implementer process group after its leader
+// has been reaped. Children keep the group id alive, so the kernel will not
+// reuse it while they exist. signal 0 skips a group that is already empty.
+// The residual race is the gap between that probe and the SIGKILL: the last
+// member can exit and the id can be reused before the kill lands.
+func KillImplementerGroup(pid int) {
+	if pid <= 0 {
+		return
+	}
+	v, _ := implGroupMu.LoadOrStore(pid, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := syscall.Kill(-pid, 0); err == syscall.ESRCH {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+var implGroupMu sync.Map // pid -> *sync.Mutex
+
+// KillReviewProcess SIGKILLs the reviewer's process group. It returns false
+// once the child has been reaped, and sends nothing. StartReviewAgent puts
+// the child in its own group; killing only the leader leaves git and shell
+// grandchildren behind. Do not use this on the implementer.
+func KillReviewProcess(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+	if v, ok := reviewProcs.Load(cmd); ok {
+		st := v.(*reviewProcGate)
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		if st.reaped {
+			return false
+		}
+		_ = signalReviewGroup(cmd.Process.Pid)
+		return true
+	}
+	_ = signalReviewGroup(cmd.Process.Pid)
+	return true
 }
