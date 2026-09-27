@@ -117,6 +117,7 @@ func (a *App) mux() http.Handler {
 	m.HandleFunc("GET /api/test-plans", a.getTestPlans)
 	m.HandleFunc("POST /api/test-plans", a.postTestPlan)
 	m.HandleFunc("GET /api/test-plans/{id}/grid", a.getTestPlanGrid)
+	m.HandleFunc("GET /api/test-plans/{id}/export", a.getTestPlanExport)
 	m.HandleFunc("GET /api/test-plans/{id}", a.getTestPlan)
 	m.HandleFunc("PATCH /api/test-plans/{id}", a.patchTestPlan)
 	m.HandleFunc("DELETE /api/test-plans/{id}", a.deleteTestPlan)

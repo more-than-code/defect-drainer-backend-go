@@ -2,11 +2,15 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joe/defect-drainer-go/internal/httpx"
+	"github.com/joe/defect-drainer-go/internal/jobs"
 	"github.com/joe/defect-drainer-go/internal/store"
 )
 
@@ -445,6 +449,33 @@ func (a *App) getTestPlanGrid(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"grid": grid})
+}
+
+func (a *App) getTestPlanExport(w http.ResponseWriter, r *http.Request) {
+	plan, err := store.GetPlan(a.DB, r.PathValue("id"))
+	if err != nil {
+		var op *store.OpError
+		if !errors.As(err, &op) {
+			httpx.WriteError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		writeOpErr(w, err)
+		return
+	}
+	app, err := store.GetApp(a.DB, plan.AppID)
+	// GetApp reports a missing row as (nil, nil). Treat that as a failed load
+	// so the export does not claim the plan has no test account.
+	if err != nil || app == nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	body := jobs.RenderPlanExport(plan, app.TestAccounts, time.Now())
+	name := fmt.Sprintf("%s-v%d.test-plan.md", plan.Key, plan.Version)
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(name))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, body)
 }
 
 func (a *App) saveTestRunAsPlan(w http.ResponseWriter, r *http.Request) {

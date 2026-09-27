@@ -136,6 +136,16 @@ func normalizeTestAccounts(in []TestAccount, rejectReserved bool) ([]TestAccount
 	return out, nil
 }
 
+// EnvSecretName reports the host variable when ref is env:NAME.
+// Free text and an empty ref return "", false.
+func EnvSecretName(ref string) (string, bool) {
+	ref = strings.TrimSpace(ref)
+	if !envSecretRefRe.MatchString(ref) {
+		return "", false
+	}
+	return strings.TrimPrefix(ref, "env:"), true
+}
+
 // AccountEnvVar is the host variable named by env.account.secret_ref when
 // that reference is env:NAME. Free text and a missing account inject nothing.
 func AccountEnvVar(env map[string]any) (string, bool) {
