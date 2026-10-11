@@ -40,6 +40,11 @@ var fileDefectNewID func(title string, now time.Time) string
 // fails the filing. Nil in production.
 var fileDefectFTSHook func(q rower, id string) error
 
+// fileDefectInsertHook, when set, runs before each defect insert. A non-nil
+// error is handled as that insert's error, so tests can drive the ID-collision
+// retry with a driver error. Nil in production.
+var fileDefectInsertHook func(id string) error
+
 // fileDefectMaxBytes matches the upload cap (api maxFileBytes). A copied
 // screenshot cannot be larger than one an operator could have uploaded.
 const fileDefectMaxBytes int64 = 25 << 20
@@ -132,7 +137,7 @@ func FileRunStepDefect(s *Store, runID, key string, in FileDefectInput) (DefectR
 			rec.Body = defectBodyFromStep(run, *step, note, rec.Evidence)
 			if err := insertFiledDefect(tx, rec, ts); err != nil {
 				rollbackFileDefectSavepoint(tx)
-				if isUniqueViolation(err) {
+				if db.IsUniqueViolation(err) {
 					continue
 				}
 				return &OpError{Status: 500, Msg: "could not file defect"}
@@ -161,7 +166,7 @@ func FileRunStepDefect(s *Store, runID, key string, in FileDefectInput) (DefectR
 		if !placed {
 			return &OpError{Status: 500, Msg: "could not file defect"}
 		}
-		if err := writeFiledFTS(tx, filed); err != nil {
+		if err := writeFiledFTS(s.DB, tx, filed); err != nil {
 			return &OpError{Status: 500, Msg: "could not file defect"}
 		}
 		if fileDefectAfterCopy != nil {
@@ -223,11 +228,13 @@ func rollbackFileDefectSavepoint(tx *sql.Tx) {
 	_, _ = tx.Exec(`RELEASE file_defect_id`)
 }
 
-func isUniqueViolation(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
-}
-
-func writeFiledFTS(q rower, rec DefectRecord) error {
+// writeFiledFTS indexes the filed defect for SQLite FTS5 search. Postgres has
+// no defects_fts table (search uses ILIKE there), so it is a no-op, as in
+// SyncDefectFTS.
+func writeFiledFTS(sqlDB *sql.DB, q rower, rec DefectRecord) error {
+	if db.IsPostgres(sqlDB) {
+		return nil
+	}
 	if fileDefectFTSHook != nil {
 		if err := fileDefectFTSHook(q, rec.ID); err != nil {
 			return err
@@ -283,6 +290,11 @@ func writeEvidenceFiles(dir string, files []struct {
 }
 
 func insertFiledDefect(tx *sql.Tx, rec DefectRecord, ts string) error {
+	if fileDefectInsertHook != nil {
+		if err := fileDefectInsertHook(rec.ID); err != nil {
+			return err
+		}
+	}
 	_, err := tx.Exec(`INSERT INTO defects (
 		id, app_id, title, severity, status, area, client, surface,
 		repos_json, labels_json, related_json, source, reporter, key_files_json,

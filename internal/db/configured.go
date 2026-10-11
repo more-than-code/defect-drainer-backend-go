@@ -3,11 +3,15 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/joe/defect-drainer-go/internal/env"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Dialect is the inventory database the process opened.
@@ -65,6 +69,35 @@ func IsPostgres(sqlDB *sql.DB) bool {
 	}
 	_, ok := sqlDB.Driver().(*qmarkDriver)
 	return ok
+}
+
+// pgUniqueViolation is the Postgres SQLSTATE for unique_violation.
+const pgUniqueViolation = "23505"
+
+// IsUniqueViolation reports whether err is a unique-constraint violation from
+// either driver. A pgx *pgconn.PgError is decided by its SQLSTATE (23505). A
+// modernc.org/sqlite *sqlite.Error counts when its extended code is
+// SQLITE_CONSTRAINT_PRIMARYKEY or SQLITE_CONSTRAINT_UNIQUE. Otherwise the
+// error text is matched, for errors whose type was lost on the way up.
+func IsUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgUniqueViolation
+	}
+	var liteErr *sqlite.Error
+	if errors.As(err, &liteErr) {
+		switch liteErr.Code() {
+		case sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") ||
+		strings.Contains(msg, "SQLSTATE "+pgUniqueViolation) ||
+		strings.Contains(msg, "duplicate key value violates unique constraint")
 }
 
 // openPostgres connects with pgx and checks that defects already exists.

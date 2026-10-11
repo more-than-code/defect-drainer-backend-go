@@ -5,13 +5,17 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 func TestRebindDollar(t *testing.T) {
@@ -338,3 +342,69 @@ type errConnector struct{ err error }
 
 func (c errConnector) Connect(context.Context) (driver.Conn, error) { return nil, c.err }
 func (c errConnector) Driver() driver.Driver                        { return nil }
+
+func TestIsUniqueViolation(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"postgres unique", &pgconn.PgError{Code: "23505"}, true},
+		{"postgres unique wrapped", fmt.Errorf("insert: %w", &pgconn.PgError{Code: "23505"}), true},
+		{"postgres foreign key", &pgconn.PgError{Code: "23503", Message: "UNIQUE constraint failed lookalike"}, false},
+		{"other error", errors.New("disk I/O error"), false},
+		{"postgres unique, type lost", errors.New(`ERROR: duplicate key value violates unique constraint "defects_pkey" (SQLSTATE 23505)`), true},
+		{"sqlstate only", errors.New("SQLSTATE 23505"), true},
+		{"duplicate key phrase only", errors.New("duplicate key value violates unique constraint"), true},
+		{"sqlite unique text", errors.New("UNIQUE constraint failed: defects.id"), true},
+		{"postgres foreign key, type lost", errors.New(`ERROR: insert or update violates foreign key constraint (SQLSTATE 23503)`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsUniqueViolation(tc.err); got != tc.want {
+				t.Fatalf("IsUniqueViolation(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsUniqueViolationSQLite(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`CREATE TABLE t (id TEXT PRIMARY KEY, email TEXT UNIQUE, name TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO t (id, email, name) VALUES ('a', 'a@x', 'n')`); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name     string
+		insert   string
+		wantCode int
+		want     bool
+	}{
+		{"primary key", `INSERT INTO t (id, email, name) VALUES ('a', 'b@x', 'n')`, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, true},
+		{"unique column", `INSERT INTO t (id, email, name) VALUES ('b', 'a@x', 'n')`, sqlite3.SQLITE_CONSTRAINT_UNIQUE, true},
+		{"not null", `INSERT INTO t (id, email) VALUES ('c', 'c@x')`, sqlite3.SQLITE_CONSTRAINT_NOTNULL, false},
+		{"missing table", `INSERT INTO missing (id) VALUES ('a')`, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := sqlDB.Exec(tc.insert)
+			if err == nil {
+				t.Fatal("insert succeeded")
+			}
+			var liteErr *sqlite.Error
+			if tc.wantCode != 0 && (!errors.As(err, &liteErr) || liteErr.Code() != tc.wantCode) {
+				t.Fatalf("want typed code %d, got %v", tc.wantCode, err)
+			}
+			if got := IsUniqueViolation(err); got != tc.want {
+				t.Fatalf("IsUniqueViolation(%v) = %v, want %v", err, got, tc.want)
+			}
+		})
+	}
+}
