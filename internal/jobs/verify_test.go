@@ -96,6 +96,7 @@ func TestRunVerificationSkipsUnknownRepo(t *testing.T) {
 		nil,
 		snapshotWorktreeReals(wts),
 		func(string, string) {},
+		nil,
 	)
 	if !run.Ran || len(run.Results) != 1 {
 		t.Fatalf("%+v", run)
@@ -129,6 +130,7 @@ func TestRunVerificationAliasExecutesInWorktree(t *testing.T) {
 		nil,
 		snapshotWorktreeReals(wts),
 		func(string, string) {},
+		nil,
 	)
 	if !run.Ok || len(run.Results) != 1 || !run.Results[0].Ok {
 		t.Fatalf("alias should run: %+v", run)
@@ -155,6 +157,7 @@ func TestRunVerificationRefusesSymlinkedWorktree(t *testing.T) {
 		nil,
 		reals,
 		func(string, string) {},
+		nil,
 	)
 	if run.Ok || len(run.Results) != 1 || run.Results[0].SkippedReason == "" {
 		t.Fatalf("symlink cwd must skip: %+v", run)

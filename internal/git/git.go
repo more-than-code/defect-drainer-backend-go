@@ -186,6 +186,55 @@ func ChooseLocalFolder() (map[string]any, error) {
 	return map[string]any{"path": p}, nil
 }
 
+func normalizeBaseSource(source string) string {
+	if strings.ToLower(strings.TrimSpace(source)) == "local" {
+		return "local"
+	}
+	return "origin"
+}
+
+func validRefToken(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+		return false
+	}
+	return !strings.ContainsAny(s, " \t\n")
+}
+
+// ResolveJobBase is the ref a batch worktree is cut from.
+// Local source uses the local branch only. GitHub source prefers
+// <remote>/<branch>, then the local branch. Neither falls through to HEAD.
+func ResolveJobBase(primaryAbs, source, remote, branch string) (ref, br string, err error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		branch = "main"
+	}
+	if !validRefToken(branch) {
+		return "", "", fmt.Errorf("invalid base branch %q", branch)
+	}
+	if normalizeBaseSource(source) == "local" {
+		if !gitOk(primaryAbs, "rev-parse", "--verify", "--end-of-options", branch) {
+			return "", "", fmt.Errorf("local base branch %q not found", branch)
+		}
+		return branch, branch, nil
+	}
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		remote = "origin"
+	}
+	remote = strings.TrimPrefix(remote, "origin/")
+	if !validRefToken(remote) {
+		return "", "", fmt.Errorf("invalid base remote %q", remote)
+	}
+	cand := remote + "/" + branch
+	if gitOk(primaryAbs, "rev-parse", "--verify", "--end-of-options", cand) {
+		return cand, branch, nil
+	}
+	if gitOk(primaryAbs, "rev-parse", "--verify", "--end-of-options", branch) {
+		return branch, branch, nil
+	}
+	return "", "", fmt.Errorf("base %s not found", cand)
+}
+
 // ResolveBaseRef prefers remote/branch, then local branch, then master (only if branch==main), then HEAD.
 func ResolveBaseRef(primaryAbs, remote, branch string) (ref, br, from string) {
 	if remote == "" {

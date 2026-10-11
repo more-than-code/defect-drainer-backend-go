@@ -274,14 +274,14 @@ func TestStartCodingAgentMarksWorkerRole(t *testing.T) {
 	if !strings.Contains(s, "ROLE=worker") {
 		t.Fatalf("child env missing SKILL_FORGE_AGENT_ROLE=worker:\n%s", s)
 	}
-	// The parent must not be mutated, and must never come out marked worker.
+	// The parent must not be mutated. That is the whole claim: this process is
+	// the test runner, not serve, and a worker running the suite is exactly the
+	// environment the delegation rules prescribe — so the ambient role says
+	// nothing about StartCodingAgent and must not be asserted on.
 	parentRoleAfter, parentRoleSetAfter := os.LookupEnv("SKILL_FORGE_AGENT_ROLE")
 	if parentRoleSetAfter != parentRoleSet || parentRoleAfter != parentRoleBefore {
 		t.Fatalf("StartCodingAgent mutated the parent role: before=%q(set=%v) after=%q(set=%v)",
 			parentRoleBefore, parentRoleSet, parentRoleAfter, parentRoleSetAfter)
-	}
-	if parentRoleAfter == "worker" {
-		t.Fatalf("the serve process is marked as a worker")
 	}
 	for _, want := range []string{
 		"ROLE (SKILL_FORGE_AGENT_ROLE=worker is set on this process)",
@@ -301,5 +301,143 @@ func TestStartCodingAgentMarksWorkerRole(t *testing.T) {
 	}
 	if !strings.Contains(s, "WORKTREE ENFORCEMENT (mandatory)") {
 		t.Fatalf("worktree enforcement block dropped:\n%s", s)
+	}
+}
+
+func TestStartCodingAgentMaxTurnsPrecedence(t *testing.T) {
+	run := func(t *testing.T, opts *CodingAgentOpts) string {
+		t.Helper()
+		out := filepath.Join(t.TempDir(), "args.txt")
+		bin := filepath.Join(t.TempDir(), "fake-grok")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + out + "\"\nexit 0\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GROK_BUILD_BIN", bin)
+		wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
+		cmd, flush, err := StartCodingAgent(t.TempDir(), "BATCH-turns", t.TempDir(), wts, "strict", nil, nil, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if flush != nil {
+			flush()
+		}
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return argvFlagValue(string(got), "--max-turns")
+	}
+
+	t.Run("unset falls back to the built-in default", func(t *testing.T) {
+		t.Setenv("DEFECT_DRAINER_GROK_BATCH_MAX_TURNS", "")
+		t.Setenv("GROK_BATCH_MAX_TURNS", "")
+		if got := run(t, nil); got != defaultBatchMaxTurns {
+			t.Fatalf("--max-turns = %q, want %q", got, defaultBatchMaxTurns)
+		}
+	})
+
+	t.Run("app setting wins over env", func(t *testing.T) {
+		t.Setenv("GROK_BATCH_MAX_TURNS", "120")
+		if got := run(t, &CodingAgentOpts{MaxTurns: 300}); got != "300" {
+			t.Fatalf("--max-turns = %q, want 300 (app setting outranks env)", got)
+		}
+	})
+
+	t.Run("env used when the app leaves it unset", func(t *testing.T) {
+		t.Setenv("GROK_BATCH_MAX_TURNS", "120")
+		if got := run(t, &CodingAgentOpts{MaxTurns: 0}); got != "120" {
+			t.Fatalf("--max-turns = %q, want 120", got)
+		}
+	})
+
+	t.Run("a non-positive app value never reaches argv", func(t *testing.T) {
+		t.Setenv("DEFECT_DRAINER_GROK_BATCH_MAX_TURNS", "")
+		t.Setenv("GROK_BATCH_MAX_TURNS", "")
+		if got := run(t, &CodingAgentOpts{MaxTurns: -7}); got != defaultBatchMaxTurns {
+			t.Fatalf("--max-turns = %q, want the default", got)
+		}
+	})
+}
+
+// -r <id> continues that exact session; -c continues the cwd's latest. Both
+// send ContinuePrompt, never the full brief, and -r wins when both are set.
+func TestStartCodingAgentSessionFlags(t *testing.T) {
+	argv := func(t *testing.T, opts *CodingAgentOpts) []string {
+		t.Helper()
+		out := filepath.Join(t.TempDir(), "args.txt")
+		bin := filepath.Join(t.TempDir(), "fake-grok")
+		script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"" + out + "\"\nexit 0\n"
+		if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GROK_BUILD_BIN", bin)
+		wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: t.TempDir(), PrimaryAbs: t.TempDir(), Branch: "b"}}
+		cmd, flush, err := StartCodingAgent(t.TempDir(), "BATCH-session", t.TempDir(), wts, "strict", nil, nil, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if flush != nil {
+			flush()
+		}
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Split(string(got), "\n")
+	}
+	has := func(args []string, flag string) bool {
+		for _, a := range args {
+			if a == flag {
+				return true
+			}
+		}
+		return false
+	}
+	const id = "01a0c8be-7e0e-7c71-92ad-cd85bf99e86f"
+
+	fresh := argv(t, nil)
+	if has(fresh, "-c") || has(fresh, "-r") {
+		t.Fatalf("a fresh spawn must not continue a session: %q", fresh)
+	}
+	if strings.HasPrefix(argvFlagValue(strings.Join(fresh, "\n"), "-p"), "Continue executing BRIEF.md") {
+		t.Fatal("a fresh spawn must send the brief prompt")
+	}
+
+	cont := argv(t, &CodingAgentOpts{Continue: true})
+	if !has(cont, "-c") || has(cont, "-r") {
+		t.Fatalf("Continue wants -c only: %q", cont)
+	}
+
+	res := argv(t, &CodingAgentOpts{Continue: true, ResumeSession: id})
+	joined := strings.Join(res, "\n")
+	if argvFlagValue(joined, "-r") != id || has(res, "-c") {
+		t.Fatalf("ResumeSession wants -r %s and no -c: %q", id, res)
+	}
+	if !strings.HasPrefix(argvFlagValue(joined, "-p"), "Continue executing BRIEF.md") {
+		t.Fatalf("resume must send ContinuePrompt, got %q", argvFlagValue(joined, "-p"))
+	}
+}
+
+// A job profile denies cwd/.grok, so the prompt's write line must say so;
+// without one, cwd is writable whole and the line stays as it was.
+func TestPromptWriteLineNamesLockedJobProfile(t *testing.T) {
+	handoff := "/data/batch-jobs/bjob_x"
+	wts := []WorktreeBinding{{Repo: "demo", WorktreeAbs: "/w", PrimaryAbs: "/p", Branch: "b"}}
+	for _, sandbox := range []string{"workspace", "strict"} {
+		with := buildBatchFixCLIPrompt(handoff, "BATCH-1", "/inv", sandbox, wts, &CodingAgentOpts{SandboxProfile: "dd-simulator"})
+		if !strings.Contains(with, "- Write: cwd ("+handoff+") except its .grok/") {
+			t.Fatalf("%s + job profile: write line must carve out .grok:\n%s", sandbox, with)
+		}
+		without := buildBatchFixCLIPrompt(handoff, "BATCH-1", "/inv", sandbox, wts, nil)
+		if strings.Contains(without, "except its .grok/") || !strings.Contains(without, "- Write: cwd ("+handoff+"), ~/.grok/") {
+			t.Fatalf("%s without a job profile: write line changed:\n%s", sandbox, without)
+		}
 	}
 }

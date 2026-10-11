@@ -29,10 +29,13 @@ CREATE TABLE IF NOT EXISTS apps (
   grok_sandbox TEXT NOT NULL DEFAULT 'strict',
   /** Pre-provisioned agent toolchain: none | flutter (per App Settings) */
   agent_toolchain TEXT NOT NULL DEFAULT 'none',
+  agent_max_turns INTEGER NOT NULL DEFAULT 0,
   /** Grant Simulator device-tree writes for batch jobs (per App Settings) */
   allow_simulator_writes INTEGER NOT NULL DEFAULT 0,
   /** Operator-defined verification commands re-run by DD after a fix job */
   verify_commands_json TEXT NOT NULL DEFAULT '[]',
+  /** Test accounts: label, username, environment, secret_ref. Never a password. */
+  test_accounts_json TEXT NOT NULL DEFAULT '[]',
   /** Batch-fix base: worktrees branch from <base_remote>/<base_branch>; PRs target base_branch. */
   base_remote TEXT NOT NULL DEFAULT 'origin',
   base_branch TEXT NOT NULL DEFAULT 'main',
@@ -150,6 +153,34 @@ CREATE TABLE IF NOT EXISTS search_outbox (
 );
 
 CREATE INDEX IF NOT EXISTS idx_search_outbox_updated ON search_outbox(updated_at);
+
+CREATE TABLE IF NOT EXISTS test_plans (
+  id TEXT PRIMARY KEY, app_id TEXT NOT NULL REFERENCES apps(id), key TEXT NOT NULL,
+  title TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT '', env_json TEXT NOT NULL DEFAULT '{}',
+  version INTEGER NOT NULL DEFAULT 1, archived INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE (app_id, key));
+CREATE TABLE IF NOT EXISTS test_plan_steps (
+  plan_id TEXT NOT NULL REFERENCES test_plans(id) ON DELETE CASCADE, key TEXT NOT NULL,
+  position INTEGER NOT NULL, section TEXT NOT NULL DEFAULT '', action TEXT NOT NULL,
+  expected TEXT NOT NULL DEFAULT '', PRIMARY KEY (plan_id, key));
+CREATE TABLE IF NOT EXISTS test_runs (
+  id TEXT PRIMARY KEY, app_id TEXT NOT NULL REFERENCES apps(id),
+  plan_id TEXT REFERENCES test_plans(id) ON DELETE SET NULL, plan_version INTEGER,
+  title TEXT NOT NULL, executor TEXT NOT NULL, executed_by TEXT NOT NULL DEFAULT '', job_id TEXT,
+  env_json TEXT NOT NULL DEFAULT '{}', refs_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL,
+  reviewed_by TEXT NOT NULL DEFAULT '', reviewed_at TEXT, review_note TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL, finished_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS test_step_results (
+  run_id TEXT NOT NULL REFERENCES test_runs(id) ON DELETE CASCADE, step_key TEXT NOT NULL,
+  position INTEGER NOT NULL, section TEXT NOT NULL DEFAULT '', action TEXT NOT NULL,
+  expected TEXT NOT NULL DEFAULT '', exploratory INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending', actual TEXT NOT NULL DEFAULT '',
+  evidence_json TEXT NOT NULL DEFAULT '[]', defect_id TEXT, review TEXT NOT NULL DEFAULT '',
+  review_note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY (run_id, step_key));
+CREATE INDEX IF NOT EXISTS idx_test_plans_app ON test_plans(app_id);
+CREATE INDEX IF NOT EXISTS idx_test_runs_app ON test_runs(app_id);
+CREATE INDEX IF NOT EXISTS idx_test_runs_plan ON test_runs(plan_id);
 `
 
 // Open creates/opens {dataRoot}/defect-drainer.db, applies SCHEMA + migrations + FTS.
@@ -206,8 +237,10 @@ func migrateAppColumns(sqlDB *sql.DB) error {
 	}{
 		{"grok_sandbox", `ALTER TABLE apps ADD COLUMN grok_sandbox TEXT NOT NULL DEFAULT 'strict'`},
 		{"agent_toolchain", `ALTER TABLE apps ADD COLUMN agent_toolchain TEXT NOT NULL DEFAULT 'none'`},
+		{"agent_max_turns", `ALTER TABLE apps ADD COLUMN agent_max_turns INTEGER NOT NULL DEFAULT 0`},
 		{"allow_simulator_writes", `ALTER TABLE apps ADD COLUMN allow_simulator_writes INTEGER NOT NULL DEFAULT 0`},
 		{"verify_commands_json", `ALTER TABLE apps ADD COLUMN verify_commands_json TEXT NOT NULL DEFAULT '[]'`},
+		{"test_accounts_json", `ALTER TABLE apps ADD COLUMN test_accounts_json TEXT NOT NULL DEFAULT '[]'`},
 		{"base_remote", `ALTER TABLE apps ADD COLUMN base_remote TEXT NOT NULL DEFAULT 'origin'`},
 		{"base_branch", `ALTER TABLE apps ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'`},
 	}

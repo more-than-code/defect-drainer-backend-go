@@ -18,15 +18,25 @@ import (
 	"github.com/joe/defect-drainer-go/internal/store"
 )
 
+func isJobConflict(err error) bool {
+	var c *jobs.ConflictError
+	return errors.As(err, &c)
+}
+
 func (a *App) postApp(w http.ResponseWriter, r *http.Request) {
 	var body map[string]any
 	if err := httpx.DecodeJSON(r, jsonBodyLimit, &body); err != nil && !errors.Is(err, io.EOF) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rec, err := store.CreateApp(a.DB, appFromMap(body))
+	recIn, err := appFromMap(body)
 	if err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		writeOpErr(w, err)
+		return
+	}
+	rec, err := store.CreateApp(a.DB, recIn)
+	if err != nil {
+		writeOpErr(w, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"app": rec})
@@ -42,13 +52,14 @@ func (a *App) patchApp(w http.ResponseWriter, r *http.Request) {
 	for k := range body {
 		has[k] = true
 	}
-	rec, err := store.UpdateAppSettings(a.DB, r.PathValue("id"), appFromMap(body), has)
+	recIn, err := appFromMap(body)
 	if err != nil {
-		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "unknown") {
-			code = http.StatusNotFound
-		}
-		httpx.WriteError(w, code, err.Error())
+		writeOpErr(w, err)
+		return
+	}
+	rec, err := store.UpdateAppSettings(a.DB, r.PathValue("id"), recIn, has)
+	if err != nil {
+		writeOpErr(w, err)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"app": rec})
@@ -66,7 +77,7 @@ func (a *App) deleteApp(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func appFromMap(b map[string]any) store.AppRecord {
+func appFromMap(b map[string]any) (store.AppRecord, error) {
 	var rec store.AppRecord
 	rec.Name, _ = b["name"].(string)
 	rec.Description, _ = b["description"].(string)
@@ -80,6 +91,11 @@ func appFromMap(b map[string]any) store.AppRecord {
 	if raw, ok := b["verify_commands"]; ok {
 		rec.VerifyCommands = parseVerifyCommands(raw)
 	}
+	// JSON numbers decode as float64; a non-number (or junk) leaves the field
+	// unset, which the store reads as "use the server default".
+	if v, ok := b["agent_max_turns"].(float64); ok {
+		rec.AgentMaxTurns = int(v)
+	}
 	rec.BaseRemote, _ = b["base_remote"].(string)
 	rec.BaseBranch, _ = b["base_branch"].(string)
 	if v, ok := b["default"].(bool); ok {
@@ -90,7 +106,14 @@ func appFromMap(b map[string]any) store.AppRecord {
 	if raw, ok := b["repo_entries"]; ok {
 		rec.RepoEntries = parseEntries(raw)
 	}
-	return rec
+	if raw, ok := b["test_accounts"]; ok {
+		accounts, err := store.ParseTestAccounts(raw)
+		if err != nil {
+			return store.AppRecord{}, err
+		}
+		rec.TestAccounts = accounts
+	}
+	return rec, nil
 }
 
 func parseVerifyCommands(raw any) []store.VerifyCommand {
@@ -522,7 +545,7 @@ func (a *App) getBatches(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list, "jobs": a.Batches.List()})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"batches": list, "jobs": a.Batches.ListView()})
 }
 
 func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
@@ -550,14 +573,7 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 	if spawn {
 		a.Batches.FlipInProgress(job.DefectIDs)
 		appRec, _ := store.GetApp(a.DB, rec.AppID)
-		primaries := map[string]string{}
-		if appRec != nil {
-			for _, e := range appRec.RepoEntries {
-				if e.URL != "" && (e.BaseSource == "local" || strings.HasPrefix(e.URL, "/")) {
-					primaries[e.Name] = e.URL
-				}
-			}
-		}
+		primaries := worktreeRequests(appRec)
 		if len(primaries) == 0 {
 			msg := "no product repos resolved for worktrees — set defect.repos and/or app.repos + workspace_root"
 			a.Batches.WriteFailClosedBrief(job, a.Roots.DefectsRoot)
@@ -597,7 +613,53 @@ func (a *App) postBatch(w http.ResponseWriter, r *http.Request) {
 			rec = *b2
 		}
 	}
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"batch": rec, "job": job})
+	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"batch": rec, "job": a.batchJobView(job)})
+}
+
+// batchJobView is the only batch job an HTTP body may carry. Action methods
+// return GetJob clones, which skip fillHarvests; the console stores that body
+// as the open job. resumable, rerunnable and simQueue come along with the
+// sanitised harvests.
+func (a *App) batchJobView(j *jobs.Job) *jobs.Job {
+	if j == nil {
+		return nil
+	}
+	if view := a.Batches.GetJobView(j.ID); view != nil {
+		return view
+	}
+	return j
+}
+
+// worktreeRequests is the local checkout plus the base that Settings saved.
+// A repo entry with an empty branch uses the app-level base_branch, then main.
+// GitHub URLs that are not a local path are not checkouts and stay out.
+func worktreeRequests(app *store.AppRecord) map[string]gitpkg.WorktreeRequest {
+	if app == nil {
+		return nil
+	}
+	remote := store.ParseGitRefName(app.BaseRemote, "origin")
+	fallback := store.ParseGitRefName(app.BaseBranch, "main")
+	out := map[string]gitpkg.WorktreeRequest{}
+	for _, e := range app.RepoEntries {
+		if e.URL == "" || (e.BaseSource != "local" && !strings.HasPrefix(e.URL, "/")) {
+			continue
+		}
+		branch := e.BaseBranch
+		if branch == "" {
+			branch = fallback
+		}
+		source := e.BaseSource
+		if source != "local" {
+			source = "origin"
+		}
+		out[e.Name] = gitpkg.WorktreeRequest{
+			PrimaryAbs: e.URL,
+			Source:     source,
+			Remote:     remote,
+			Branch:     branch,
+		}
+	}
+	return out
 }
 
 func (a *App) getBatch(w http.ResponseWriter, r *http.Request) {
@@ -610,7 +672,7 @@ func (a *App) getBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) getBatchJob(w http.ResponseWriter, r *http.Request) {
-	j := a.Batches.GetJob(r.PathValue("id"))
+	j := a.Batches.GetJobView(r.PathValue("id"))
 	if j == nil {
 		httpx.WriteError(w, http.StatusNotFound, "not found")
 		return
@@ -693,11 +755,27 @@ func (a *App) deleteBatchJob(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := a.Batches.DeleteJob(id); err != nil {
+	cleanup, err := a.Batches.DeleteJob(id)
+	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "jobId": id, "cleanup": cleanup})
+}
+
+// deletePreview says what DELETE would discard per repo; it changes nothing.
+func (a *App) deletePreview(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !store.IsSafeJobID(id) {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	repos, err := a.Batches.DeletePreview(id)
+	if err != nil {
+		httpx.WriteError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"repos": repos})
 }
 
 func (a *App) stopBatchJob(w http.ResponseWriter, r *http.Request) {
@@ -710,32 +788,85 @@ func (a *App) stopBatchJob(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, code, err.Error())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": a.batchJobView(j)})
 }
 
 func (a *App) rerunBatchJob(w http.ResponseWriter, r *http.Request) {
-	j := a.Batches.GetJob(r.PathValue("id"))
-	if j == nil {
-		httpx.WriteError(w, http.StatusNotFound, "not found")
-		return
-	}
-	if err := a.Batches.StartSpawn(j.ID, a.Roots.DefectsRoot); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": a.Batches.GetJob(j.ID)})
+	a.restartBatchJob(w, r, false)
 }
 
-func (a *App) createPRs(w http.ResponseWriter, r *http.Request) {
-	j, err := a.Batches.CreatePRs(r.PathValue("id"))
+func (a *App) resumeBatchJob(w http.ResponseWriter, r *http.Request) {
+	a.restartBatchJob(w, r, true)
+}
+
+// restartBatchJob: 409 while an agent is live, 400 with the rule's reason when
+// the job cannot restart, 404 for an unknown id.
+func (a *App) restartBatchJob(w http.ResponseWriter, r *http.Request, resume bool) {
+	id := r.PathValue("id")
+	if !store.IsSafeJobID(id) {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	j, err := a.Batches.Restart(id, a.Roots.DefectsRoot, resume)
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "not found") {
+		switch {
+		case errors.Is(err, jobs.ErrJobLive):
+			code = http.StatusConflict
+		case isJobConflict(err):
+			code = http.StatusConflict
+		case strings.Contains(err.Error(), "not found"):
 			code = http.StatusNotFound
 		}
 		httpx.WriteError(w, code, err.Error())
 		return
 	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": a.batchJobView(j)})
+}
+
+func (a *App) shipPreview(w http.ResponseWriter, r *http.Request) {
+	preview, err := a.Batches.ShipPreview(r.PathValue("id"))
+	if err != nil {
+		code := http.StatusBadRequest
+		if isJobConflict(err) {
+			code = http.StatusConflict
+		} else if strings.Contains(err.Error(), "not found") {
+			code = http.StatusNotFound
+		}
+		httpx.WriteError(w, code, err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, preview)
+}
+
+func (a *App) createPRs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Commit  bool   `json:"commit"`
+		Message string `json:"message"`
+	}
+	if err := httpx.DecodeJSON(r, jsonBodyLimit, &body); err != nil && !errors.Is(err, io.EOF) {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	body.Message = strings.TrimSpace(body.Message)
+	if len(body.Message) > 2000 {
+		httpx.WriteError(w, http.StatusBadRequest, "commit message is too long")
+		return
+	}
+	j, err := a.Batches.CreatePRs(r.PathValue("id"), gitpkg.ShipRequest{
+		Commit: body.Commit, Message: body.Message,
+	})
+	if err != nil {
+		code := http.StatusBadRequest
+		if isJobConflict(err) {
+			code = http.StatusConflict
+		} else if strings.Contains(err.Error(), "not found") {
+			code = http.StatusNotFound
+		}
+		httpx.WriteError(w, code, err.Error())
+		return
+	}
+	j = a.batchJobView(j)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j, "prs": j.PRs})
 }
 
@@ -743,12 +874,15 @@ func (a *App) refreshPRs(w http.ResponseWriter, r *http.Request) {
 	j, err := a.Batches.RefreshPRs(r.PathValue("id"))
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "not found") {
+		if isJobConflict(err) {
+			code = http.StatusConflict
+		} else if strings.Contains(err.Error(), "not found") {
 			code = http.StatusNotFound
 		}
 		httpx.WriteError(w, code, err.Error())
 		return
 	}
+	j = a.batchJobView(j)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"job": j, "prs": j.PRs})
 }
 

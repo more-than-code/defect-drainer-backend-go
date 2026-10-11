@@ -536,6 +536,9 @@ func TestWorkerSpawnAndGhPRRoutes(t *testing.T) {
 	if out, err := cm.CombinedOutput(); err != nil {
 		t.Fatalf("commit AGENTS.md: %s", out)
 	}
+	if out, err := exec.Command("git", "-C", primary, "update-ref", "refs/remotes/origin/main", "HEAD").CombinedOutput(); err != nil {
+		t.Fatalf("origin/main: %s", out)
+	}
 
 	mark := filepath.Join(t.TempDir(), "spawned")
 	grok := filepath.Join(t.TempDir(), "fake-grok")
@@ -560,7 +563,7 @@ exit 1
 	patched := doJSON(t, app.Handler, http.MethodPatch, "/api/apps/"+store.SeededTutoredWebappAppID, map[string]any{
 		"grok_sandbox": "workspace",
 		"repo_entries": []map[string]any{
-			{"name": "demo", "url": primary, "base_source": "local", "base_branch": "main"},
+			{"name": "demo", "url": primary, "base_source": "origin", "base_branch": "main"},
 		},
 	})
 	if patched.Code != 200 {
@@ -613,6 +616,9 @@ exit 1
 	}
 	if len(batchOut.Job.Worktrees) == 0 {
 		t.Fatalf("expected worktrees on job: %s", created.Body)
+	}
+	if batchOut.Job.Worktrees[0].BaseSource != "origin" || batchOut.Job.Worktrees[0].BaseBranch != "main" || batchOut.Job.Worktrees[0].BaseRef != "origin/main" {
+		t.Fatalf("worktree base: %+v", batchOut.Job.Worktrees[0])
 	}
 	briefBytes, err := os.ReadFile(filepath.Join(app.Roots.DataRoot, "batch-jobs", batchOut.Job.ID, "BRIEF.md"))
 	if err != nil {
@@ -890,24 +896,26 @@ exit 0
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
-	var resolved store.DefectRecord
+	var harvested store.DefectRecord
 	for time.Now().Before(deadline) {
 		d := doJSON(t, app.Handler, http.MethodGet, "/api/defects/"+fixedID, nil)
 		var wrap struct {
 			Defect store.DefectRecord `json:"defect"`
 		}
 		_ = json.Unmarshal(d.Body.Bytes(), &wrap)
-		if wrap.Defect.Status == "resolved" {
-			resolved = wrap.Defect
+		if len(wrap.Defect.FixEvidence) > 0 {
+			harvested = wrap.Defect
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if resolved.Status != "resolved" {
-		t.Fatalf("defect %s not resolved via StartSpawn harvest", fixedID)
+	// A screenshot of a tree that did not change is not a fix. Evidence still
+	// imports; the defect stays open (nothing to review).
+	if len(harvested.FixEvidence) == 0 {
+		t.Fatalf("defect %s evidence not imported via StartSpawn harvest", fixedID)
 	}
-	if len(resolved.FixEvidence) == 0 {
-		t.Fatal("resolved defect has no fix_evidence")
+	if harvested.Status == "resolved" {
+		t.Fatalf("defect %s resolved with no diff and no fix-notes", fixedID)
 	}
 	still := doJSON(t, app.Handler, http.MethodGet, "/api/defects/"+openID, nil)
 	var openWrap struct {
@@ -941,7 +949,7 @@ exit 0
 	if !strings.Contains(string(agentLog), "stdout-from-agent") {
 		t.Fatalf("agent.log missing stdout: %s", agentLog)
 	}
-	// The completion goroutine keeps writing job.json after the defect resolves
+	// The completion goroutine keeps writing job.json after harvest
 	// (batch sync, then a final log line). Returning before it finishes races
 	// t.TempDir cleanup, which fails the package with "directory not empty".
 	waitJobLogContains(t, app, batchOut.Job.ID, 5*time.Second, "batch complete")
@@ -1160,5 +1168,89 @@ func TestBatchJobDiffEndpoint(t *testing.T) {
 	}
 	if !sawReflow || !sawToken {
 		t.Fatalf("kind=all missing both kinds: %s", okAll.Body)
+	}
+}
+
+// The turn cap is an operator-facing App Settings field: it has to survive a
+// PATCH round-trip, clamp hostile input, and stay absent when unset so an
+// existing app keeps the server default.
+func TestAppAgentMaxTurnsRoundTrip(t *testing.T) {
+	app := testApp(t)
+	h := app.Handler
+
+	rec := doJSON(t, h, "POST", "/api/apps", map[string]any{"name": "turns-app", "repos": []string{"demo"}})
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		t.Fatalf("create app: %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		App struct {
+			ID            string `json:"id"`
+			AgentMaxTurns int    `json:"agent_max_turns"`
+		} `json:"app"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	id := created.App.ID
+	if id == "" {
+		t.Fatalf("no app id in %s", rec.Body.String())
+	}
+	if created.App.AgentMaxTurns != 0 {
+		t.Fatalf("a new app must default to unset, got %d", created.App.AgentMaxTurns)
+	}
+
+	read := func(t *testing.T) int {
+		t.Helper()
+		rec := doJSON(t, h, "GET", "/api/apps", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("list apps: %d", rec.Code)
+		}
+		var got struct {
+			Apps []struct {
+				ID            string `json:"id"`
+				AgentMaxTurns int    `json:"agent_max_turns"`
+			} `json:"apps"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range got.Apps {
+			if a.ID == id {
+				return a.AgentMaxTurns
+			}
+		}
+		t.Fatalf("app %s missing from list", id)
+		return -1
+	}
+
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"agent_max_turns": 240}); rec.Code != http.StatusOK {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := read(t); got != 240 {
+		t.Fatalf("after patch = %d, want 240", got)
+	}
+
+	// An unrelated PATCH must not silently clear it.
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"description": "unrelated"}); rec.Code != http.StatusOK {
+		t.Fatalf("patch 2: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := read(t); got != 240 {
+		t.Fatalf("unrelated patch cleared the cap: %d", got)
+	}
+
+	// A fat-fingered value is clamped, not honoured.
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"agent_max_turns": 9999999}); rec.Code != http.StatusOK {
+		t.Fatalf("patch 3: %d", rec.Code)
+	}
+	if got := read(t); got != store.AgentMaxTurnsLimit {
+		t.Fatalf("hostile value not clamped: %d", got)
+	}
+
+	// Explicitly back to unset.
+	if rec := doJSON(t, h, "PATCH", "/api/apps/"+id, map[string]any{"agent_max_turns": 0}); rec.Code != http.StatusOK {
+		t.Fatalf("patch 4: %d", rec.Code)
+	}
+	if got := read(t); got != 0 {
+		t.Fatalf("could not return to unset: %d", got)
 	}
 }

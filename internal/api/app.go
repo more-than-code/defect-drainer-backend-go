@@ -3,6 +3,7 @@ package api
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -61,6 +62,11 @@ func Build(opts Options) (*App, error) {
 		lock.Close()
 		return nil, err
 	}
+	if err := evidenceDirRequired(sqlDB, roots.DefectsRoot); err != nil {
+		sqlDB.Close()
+		lock.Close()
+		return nil, err
+	}
 	if !opts.SkipMigrate {
 		if err := migrateFilesystemIfNeeded(sqlDB, roots.DefectsRoot); err != nil {
 			sqlDB.Close()
@@ -82,6 +88,9 @@ func Build(opts Options) (*App, error) {
 		Jobs:    jobs.NewRunner(st, roots.DataRoot),
 		Batches: jobs.NewBatchRunner(st, roots.DataRoot),
 	}
+	// Queued simulator jobs survived the restart. Start the oldest now that
+	// the runner exists; the rest follow as each agent's loop ends.
+	a.Batches.ResumeQueue(roots.DefectsRoot)
 	a.Handler = a.mux()
 	return a, nil
 }
@@ -107,6 +116,25 @@ func (a *App) mux() http.Handler {
 	m.HandleFunc("GET /api/apps/{id}", a.getApp)
 	m.HandleFunc("PATCH /api/apps/{id}", a.patchApp)
 	m.HandleFunc("DELETE /api/apps/{id}", a.deleteApp)
+	m.HandleFunc("GET /api/test-plans", a.getTestPlans)
+	m.HandleFunc("POST /api/test-plans", a.postTestPlan)
+	m.HandleFunc("GET /api/test-plans/{id}/grid", a.getTestPlanGrid)
+	m.HandleFunc("GET /api/test-plans/{id}/export", a.getTestPlanExport)
+	m.HandleFunc("GET /api/test-plans/{id}", a.getTestPlan)
+	m.HandleFunc("PATCH /api/test-plans/{id}", a.patchTestPlan)
+	m.HandleFunc("DELETE /api/test-plans/{id}", a.deleteTestPlan)
+	m.HandleFunc("GET /api/test-runs", a.getTestRuns)
+	m.HandleFunc("POST /api/test-runs", a.postTestRun)
+	m.HandleFunc("GET /api/test-runs/{id}", a.getTestRun)
+	m.HandleFunc("DELETE /api/test-runs/{id}", a.deleteTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/steps", a.postTestRunStep)
+	m.HandleFunc("PATCH /api/test-runs/{id}/steps/{key}", a.patchTestRunStep)
+	m.HandleFunc("POST /api/test-runs/{id}/steps/{key}/evidence", a.postTestRunStepEvidence)
+	m.HandleFunc("POST /api/test-runs/{id}/steps/{key}/file-defect", a.fileTestRunStepDefect)
+	m.HandleFunc("POST /api/test-runs/{id}/finish", a.finishTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/abandon", a.abandonTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/review", a.reviewTestRun)
+	m.HandleFunc("POST /api/test-runs/{id}/save-as-plan", a.saveTestRunAsPlan)
 	m.HandleFunc("GET /api/defects", a.getDefects)
 	m.HandleFunc("GET /api/defects/{id}", a.getDefect)
 	m.HandleFunc("PATCH /api/defects/{id}", a.patchDefect)
@@ -132,8 +160,11 @@ func (a *App) mux() http.Handler {
 	m.HandleFunc("GET /api/batch-jobs/{id}", a.getBatchJob)
 	m.HandleFunc("GET /api/batch-jobs/{id}/diff/{repo}", a.getBatchJobDiff)
 	m.HandleFunc("DELETE /api/batch-jobs/{id}", a.deleteBatchJob)
+	m.HandleFunc("GET /api/batch-jobs/{id}/delete-preview", a.deletePreview)
 	m.HandleFunc("POST /api/batch-jobs/{id}/stop", a.stopBatchJob)
 	m.HandleFunc("POST /api/batch-jobs/{id}/rerun", a.rerunBatchJob)
+	m.HandleFunc("POST /api/batch-jobs/{id}/resume", a.resumeBatchJob)
+	m.HandleFunc("GET /api/batch-jobs/{id}/ship-preview", a.shipPreview)
 	m.HandleFunc("POST /api/batch-jobs/{id}/create-prs", a.createPRs)
 	m.HandleFunc("POST /api/batch-jobs/{id}/refresh-prs", a.refreshPRs)
 	m.HandleFunc("POST /api/git/branches", a.gitBranches)
@@ -255,7 +286,7 @@ func (a *App) getDefect(w http.ResponseWriter, r *http.Request) {
 func (a *App) getEvidence(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	file := r.PathValue("file")
-	if !store.IsSafeID(id) || strings.Contains(file, "..") || strings.Contains(file, "/") || strings.Contains(file, `\`) {
+	if !store.IsEvidenceOwnerID(id) || strings.Contains(file, "..") || strings.Contains(file, "/") || strings.Contains(file, `\`) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid path")
 		return
 	}
@@ -289,6 +320,85 @@ func (a *App) getEvidence(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", typ)
 	http.ServeFile(w, r, abs)
+}
+
+// evidenceDirRequired refuses to start when a defect or test-step row references
+// evidence files and those files are not in {DEFECTS_ROOT}/evidence. It does not
+// create anything. A directory with none of the referenced files (empty, or nested
+// one level too deep) is not enough. The refusal text stays the same either way.
+func evidenceDirRequired(sqlDB *sql.DB, defectsRoot string) error {
+	var n int
+	err := sqlDB.QueryRow(`
+		SELECT
+		  (SELECT COUNT(*) FROM defects
+		    WHERE json_array_length(evidence_json) > 0
+		       OR json_array_length(fix_evidence_json) > 0)
+		  +
+		  (SELECT COUNT(*) FROM test_step_results
+		    WHERE json_array_length(evidence_json) > 0)
+	`).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	dir := paths.EvidenceDir(defectsRoot)
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		return fmt.Errorf("evidence directory %s does not exist, but defects reference evidence files; see docs/operating.md", dir)
+	}
+	rows, err := sqlDB.Query(`
+		SELECT value FROM (
+			SELECT value FROM defects, json_each(evidence_json)
+			UNION ALL
+			SELECT value FROM defects, json_each(fix_evidence_json)
+			UNION ALL
+			SELECT value FROM test_step_results, json_each(evidence_json)
+		) LIMIT 50
+	`)
+	if err != nil {
+		return err
+	}
+	var rels []string
+	for rows.Next() {
+		var rel string
+		if err := rows.Scan(&rel); err != nil {
+			rows.Close()
+			return err
+		}
+		rels = append(rels, rel)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, rel := range rels {
+		if referencedEvidenceFile(defectsRoot, rel) {
+			return nil
+		}
+	}
+	return fmt.Errorf("evidence directory %s exists, but none of the referenced evidence files were found there; see docs/operating.md", dir)
+}
+
+// referencedEvidenceFile reports whether rel is a regular file under
+// {DEFECTS_ROOT}/evidence. Confinement matches inventoryEvidencePaths: clean
+// the joined path and reject anything that escapes that directory. The path
+// is not passed through EvalSymlinks.
+func referencedEvidenceFile(defectsRoot, rel string) bool {
+	if rel == "" || strings.ContainsAny(rel, "\x00\n\r`") {
+		return false
+	}
+	norm := strings.TrimLeft(strings.ReplaceAll(rel, "\\", "/"), "/")
+	cleanRoot := filepath.Clean(paths.EvidenceDir(defectsRoot))
+	cleanJoin := filepath.Clean(filepath.Join(defectsRoot, filepath.FromSlash(norm)))
+	r, err := filepath.Rel(cleanRoot, cleanJoin)
+	if err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+		return false
+	}
+	st, err := os.Stat(cleanJoin)
+	return err == nil && st.Mode().IsRegular()
 }
 
 // migrateFilesystemIfNeeded is a no-op until tables are empty and legacy FS exists.

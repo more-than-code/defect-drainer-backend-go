@@ -2,12 +2,19 @@ package git
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unicode/utf8"
 
 	"github.com/joe/defect-drainer-go/internal/env"
 )
@@ -68,6 +75,7 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 type lineForwarder struct {
 	mu     sync.Mutex
 	buf    []byte
+	secret []byte
 	emit   func(string)
 	ch     chan string
 	done   chan struct{}
@@ -108,38 +116,92 @@ func (f *lineForwarder) Write(p []byte) (int, error) {
 	if f == nil {
 		return len(p), nil
 	}
-	norm := bytes.ReplaceAll(p, []byte("\r\n"), []byte("\n"))
-	norm = bytes.ReplaceAll(norm, []byte("\r"), []byte("\n"))
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
 		return len(p), nil
 	}
-	f.buf = append(f.buf, norm...)
-	var lines []string
-	for {
-		i := bytes.IndexByte(f.buf, '\n')
-		if i >= 0 {
-			line := string(f.buf[:i])
-			f.buf = f.buf[i+1:]
-			if strings.TrimSpace(line) != "" {
-				lines = append(lines, capLine(line))
-			}
-			continue
-		}
-		if len(f.buf) >= maxLogBlock {
-			lines = append(lines, capLine(string(f.buf[:maxLogBlock])))
-			f.buf = append([]byte(nil), f.buf[maxLogBlock:]...)
-			continue
-		}
-		break
-	}
+	f.buf = append(f.buf, p...)
+	f.redactBuf()
+	lines := f.drain(false)
 	ch := f.ch
 	f.mu.Unlock()
 	for _, line := range lines {
 		ch <- line
 	}
 	return len(p), nil
+}
+
+// redactBuf replaces the secret before any newline normalization or cut, and
+// holds back len(secret)-1 bytes inside drain so a value split across writes
+// is still one match.
+func (f *lineForwarder) redactBuf() {
+	if len(f.secret) == 0 || len(f.buf) == 0 {
+		return
+	}
+	f.buf = bytes.ReplaceAll(f.buf, f.secret, []byte(redactedMark))
+}
+
+func (f *lineForwarder) drain(flush bool) []string {
+	limit := f.normalizeSafe(flush)
+	if limit == 0 {
+		return nil
+	}
+	var lines []string
+	for {
+		window := f.buf[:limit]
+		i := bytes.IndexByte(window, '\n')
+		if i >= 0 {
+			line := string(f.buf[:i])
+			f.buf = f.buf[i+1:]
+			limit = len(f.buf)
+			if !flush && len(f.secret) > 1 {
+				keep := len(f.secret) - 1
+				if limit <= keep {
+					break
+				}
+				limit -= keep
+			}
+			if strings.TrimSpace(line) != "" {
+				lines = append(lines, capLine(line))
+			}
+			continue
+		}
+		if limit >= maxLogBlock {
+			lines = append(lines, capLine(string(f.buf[:maxLogBlock])))
+			f.buf = append([]byte(nil), f.buf[maxLogBlock:]...)
+			limit = len(f.buf)
+			if !flush && len(f.secret) > 1 {
+				keep := len(f.secret) - 1
+				if limit <= keep {
+					break
+				}
+				limit -= keep
+			}
+			continue
+		}
+		break
+	}
+	return lines
+}
+
+// normalizeSafe turns CR line endings into LF in the portion of buf that is
+// safe to emit. The held-back tail is left raw so a secret containing a
+// carriage return is still intact for the next Write.
+func (f *lineForwarder) normalizeSafe(flush bool) int {
+	keep := 0
+	if !flush && len(f.secret) > 1 {
+		keep = len(f.secret) - 1
+	}
+	if keep >= len(f.buf) {
+		return 0
+	}
+	head := f.buf[:len(f.buf)-keep]
+	tail := append([]byte(nil), f.buf[len(f.buf)-keep:]...)
+	head = bytes.ReplaceAll(head, []byte("\r\n"), []byte("\n"))
+	head = bytes.ReplaceAll(head, []byte("\r"), []byte("\n"))
+	f.buf = append(head, tail...)
+	return len(head)
 }
 
 // Flush emits a trailing partial line, closes the consumer, and waits for it
@@ -155,26 +217,54 @@ func (f *lineForwarder) Flush() {
 		<-f.done
 		return
 	}
-	rem := ""
-	if s := strings.TrimSpace(string(f.buf)); s != "" {
-		rem = capLine(s)
-	}
+	f.redactBuf()
+	lines := f.drain(true)
 	f.buf = nil
 	f.closed = true
 	ch := f.ch
 	f.mu.Unlock()
-	if rem != "" {
-		ch <- rem
+	for _, line := range lines {
+		ch <- line
 	}
 	close(ch)
 	<-f.done
 }
 
 // VerifySpec is one operator verification command, for the spawn prompt only.
+// defaultBatchMaxTurns is the fallback when neither App Settings nor the env
+// sets one. Kept as the historical value so an unset app behaves as before.
+const defaultBatchMaxTurns = "80"
+
 type VerifySpec struct {
 	Repo    string
 	Command string
 }
+
+// AgentEnd is the streaming-json `end` event. Field names verified against
+// Grok Build 1.0.40 (2026-09-22) and deliberately mixed-case: stopReason and
+// sessionId are camel, num_turns and total_cost_usd are snake. stopReason is
+// snake_case *values* since 1.0 (`end_turn`, `cancelled`) — a driver loop
+// matching the pre-1.0 `EndTurn` matches nothing and loops until its cap.
+type AgentEnd struct {
+	StopReason   string  `json:"stopReason"`
+	SessionID    string  `json:"sessionId"`
+	NumTurns     int     `json:"num_turns"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+}
+
+// ContinuePrompt resumes an iteration. It is a code constant, never
+// model-authored: the worker may not widen its own completion contract, and the
+// marker spellings here are the ones artifactsComplete matches exactly.
+const ContinuePrompt = `Continue executing BRIEF.md and PROCESS.md. Resume where you left off.
+Do not stop early. Required artifacts (exact; Defect Drainer matches these, not prose):
+- NOTES.md
+- for each defect you claim fixed: fix-notes/<DEF-id>.md AND
+  fix-evidence/<DEF-id>/fix-01.png
+- to decline a defect, a full line in NOTES.md: UNFIXED: <DEF-id>
+- if the sandbox is strict and you cannot screenshot, a full line:
+  NO-SCREENSHOT: <DEF-id>
+  (that stops the loop only; harvest will not resolve without a new image)
+Do not invent other marker spellings. Do not delegate onward.`
 
 // CodingAgentOpts is extra spawn wiring (toolchain PATH, job-scoped sandbox
 // profile, prompt notes). Nil is a no-op.
@@ -184,6 +274,326 @@ type CodingAgentOpts struct {
 	ToolchainNotes []string
 	VerifyCommands []VerifySpec
 	AlreadyFailing []string
+	// Continue resumes the most recent session for this cwd (-c) with
+	// ContinuePrompt instead of sending the full brief prompt again.
+	Continue bool
+	// ResumeSession resumes that exact session (-r <id>) with ContinuePrompt.
+	// An operator Resume uses it so the log names the session continued.
+	// Wins over Continue.
+	ResumeSession string
+	// OnEnd receives the `end` event; OnMaxTurns fires on the separate
+	// max_turns_reached event, which is how turn exhaustion is told apart from
+	// a genuine failure (both exit non-zero).
+	OnEnd      func(AgentEnd)
+	OnMaxTurns func()
+	// MaxTurns is the app's configured turn cap. Zero falls back to the env
+	// override, then the built-in default.
+	MaxTurns int
+	// Prompt, when set, replaces the batch-fix prompt. Empty keeps today's text.
+	Prompt string
+	// ContinuePrompt, when set, replaces ContinuePrompt on -c / -r. Empty
+	// keeps the batch-fix continue prompt.
+	ContinuePrompt string
+	// Secret is redacted from agent.log. It is never written anywhere else
+	// by this function. Empty disables the redactor.
+	Secret string
+	// StripEnv are host environment names removed before ExtraEnv is applied.
+	// DD_TEST_ACCOUNT_PASSWORD is always removed from the inherited environment.
+	StripEnv []string
+}
+
+// agentStream parses streaming-json (NDJSON) stdout **before** lineForwarder
+// sees it. The order is load-bearing: lineForwarder caps a line at maxLogBlock
+// mid-line, so unmarshalling its output would slice a JSON object in half, put
+// thoughts in the job log before they could be filtered, and could lose the
+// `end` event entirely. Every raw byte still reaches agent.log.
+type agentStream struct {
+	raw        io.Writer
+	text       *lineForwarder
+	errs       *lineForwarder
+	onEnd      func(AgentEnd)
+	onMaxTurns func()
+	// onText receives each text payload before it is split into log lines.
+	// Nil for the implementer. The reviewer reassembles findings from these
+	// chunks; the log forwarder is the wrong source because it cuts a line
+	// at maxLogBlock.
+	onText func(string)
+	// onTool receives tool_call and tool_call_update bodies. Nil for the
+	// implementer. The reviewer uses them as proof a worktree diff was read.
+	onTool func([]byte)
+	pend   []byte
+	// pendLimit caps a newline-less stdout blob. Zero keeps maxAgentLogBytes
+	// so production stays at 8 MiB; tests set a smaller value.
+	pendLimit int
+	// textPend joins word-sized `text` deltas. Write runs on os/exec's copy
+	// loop and Flush runs after Wait, so this buffer needs no lock.
+	textPend []byte
+	secret   []byte
+}
+
+func (a *agentStream) Write(p []byte) (int, error) {
+	if a.raw != nil {
+		_, _ = a.raw.Write(p)
+	}
+	a.pend = append(a.pend, p...)
+	for {
+		i := bytes.IndexByte(a.pend, '\n')
+		if i < 0 {
+			// A child dumping a huge blob with no newline must not grow this
+			// buffer without bound. Drop it with a marker rather than unmarshal.
+			if len(a.pend) > a.pendCap() {
+				// Prose already parsed must stay ahead of the marker. The
+				// blob itself is dropped; agent.log already has the bytes.
+				a.flushText()
+				a.emit(a.text, logTruncateMark)
+				a.pend = a.pend[:0]
+			}
+			break
+		}
+		line := append([]byte(nil), a.pend[:i]...)
+		a.pend = a.pend[i+1:]
+		a.handle(line)
+	}
+	return len(p), nil
+}
+
+func (a *agentStream) pendCap() int {
+	if a != nil && a.pendLimit > 0 {
+		return a.pendLimit
+	}
+	return maxAgentLogBytes
+}
+
+func (a *agentStream) emit(f *lineForwarder, line string) {
+	if f == nil || line == "" {
+		return
+	}
+	_, _ = f.Write([]byte(line + "\n"))
+}
+
+func (a *agentStream) handle(line []byte) {
+	t := bytes.TrimSpace(line)
+	if len(t) == 0 {
+		return
+	}
+	// Non-JSON: an older CLI, or a fake bin in tests that echoes argv. Keep it
+	// as an ordinary log line rather than discarding the run's only output.
+	if t[0] != '{' {
+		a.flushText()
+		a.emit(a.text, string(t))
+		return
+	}
+	// Type only. tool_call and tool_call_update carry `content` as an array
+	// (1.0.40); decoding that field as a string fails the whole event and
+	// would dump the raw line into the job log. `end` is decoded on its own
+	// so a nested `usage` object does not disturb AgentEnd.
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(t, &head); err != nil {
+		// A truncated tool_call_update is still one `{` line, tens of KB.
+		// The bytes are in agent.log; the job log gets a length, not the body.
+		a.flushText()
+		a.emit(a.text, fmt.Sprintf("invalid agent event (%d bytes; see agent.log)", len(t)))
+		return
+	}
+	switch head.Type {
+	case "text":
+		payload := textPayload(t)
+		if a.onText != nil && payload != "" {
+			a.onText(payload)
+		}
+		a.appendText(payload)
+	case "end":
+		a.flushText()
+		var ev struct{ AgentEnd }
+		if err := json.Unmarshal(t, &ev); err != nil {
+			a.emit(a.text, string(t))
+			return
+		}
+		if a.onEnd != nil {
+			a.onEnd(ev.AgentEnd)
+		}
+	case "tool_call", "tool_call_update":
+		if a.onTool != nil {
+			a.onTool(append([]byte(nil), t...))
+		}
+		// Same as the default: the body stays in agent.log, not the job log.
+		a.flushText()
+	case "max_turns_reached":
+		// The positive signal for turn exhaustion, which also exits non-zero.
+		a.flushText()
+		if a.onMaxTurns != nil {
+			a.onMaxTurns()
+		}
+	case "error":
+		a.flushText()
+		// message, with content kept as a string so a non-string content still
+		// falls through to the raw line the way the shared decode used to.
+		var ev struct {
+			Message string `json:"message"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(t, &ev); err != nil {
+			a.emit(a.text, string(t))
+			return
+		}
+		msg := ev.Message
+		if msg == "" {
+			msg = string(t)
+		}
+		a.emit(a.errs, "agent error: "+msg)
+	default:
+		// thought, tool_call, tool_call_update, usage, available_commands, and
+		// whatever a later version adds. agent.log keeps them; job.log stays
+		// readable. Flush first so prose before the event is one line.
+		a.flushText()
+	}
+}
+
+// textPayload is the operator-visible body of a text event. Grok 1.0.40 sends
+// `data`. Older shapes use text, then message, then content. Each key is read
+// on its own so a sibling that is not a string (content:[] or text:1) does
+// not drop a string sitting next to it. Absent, null, non-string, and empty
+// values are skipped. No string payload logs nothing.
+func textPayload(raw []byte) string {
+	var ev map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return ""
+	}
+	for _, key := range []string{"data", "text", "message", "content"} {
+		v, ok := ev[key]
+		if !ok || len(v) == 0 || string(v) == "null" {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			continue
+		}
+		if s == "" {
+			continue
+		}
+		return s
+	}
+	return ""
+}
+
+func (a *agentStream) appendText(payload string) {
+	if payload == "" {
+		return
+	}
+	a.textPend = append(a.textPend, payload...)
+	if len(a.secret) > 0 {
+		a.textPend = bytes.ReplaceAll(a.textPend, a.secret, []byte(redactedMark))
+	}
+	a.takeTextLines()
+}
+
+// takeTextLines emits completed lines and any maxLogBlock chunk. A short
+// partial stays buffered. Newline-terminated lines keep their own spacing;
+// a line that is only whitespace is dropped.
+func (a *agentStream) textLimit(flush bool) int {
+	n := len(a.textPend)
+	if !flush && len(a.secret) > 1 {
+		keep := len(a.secret) - 1
+		if n <= keep {
+			return 0
+		}
+		return n - keep
+	}
+	return n
+}
+
+func (a *agentStream) takeTextLines() {
+	a.takeText(false)
+}
+
+func (a *agentStream) takeText(flush bool) {
+	limit := a.textLimit(flush)
+	for limit > 0 {
+		end := limit
+		if end > maxLogBlock {
+			end = maxLogBlock
+		}
+		if i := bytes.IndexByte(a.textPend[:end], '\n'); i >= 0 {
+			line := string(a.textPend[:i])
+			a.textPend = a.textPend[i+1:]
+			limit = a.textLimit(flush)
+			if strings.TrimSpace(line) != "" {
+				a.emit(a.text, line)
+			}
+			continue
+		}
+		if !flush && limit < maxLogBlock {
+			break
+		}
+		if len(a.textPend) < maxLogBlock {
+			break
+		}
+		cut := textCut(a.textPend)
+		if cut < 1 {
+			cut = 1
+		}
+		chunk := string(a.textPend[:cut])
+		a.textPend = a.textPend[cut:]
+		limit = a.textLimit(flush)
+		if strings.TrimSpace(chunk) != "" {
+			a.emit(a.text, chunk)
+		}
+	}
+	// Drop the backing array of a huge delta once the live partial is short,
+	// so one long event cannot pin megabytes for the rest of the run.
+	if cap(a.textPend) > maxLogBlock {
+		a.textPend = append([]byte(nil), a.textPend...)
+	}
+}
+
+// textCut is the next chunk length for a buffer that has reached maxLogBlock
+// with no newline in that window. If a UTF-8 rune straddles the cap, the cut
+// moves back at most 3 bytes to the rune start so the partial rune stays
+// buffered. A window of continuation bytes still returns at least one byte.
+func textCut(buf []byte) int {
+	cut := maxLogBlock
+	if cut > len(buf) {
+		cut = len(buf)
+	}
+	if cut == 0 {
+		return 0
+	}
+	if cut < len(buf) && !utf8.RuneStart(buf[cut]) {
+		for n := 1; n <= 3 && cut-n > 0; n++ {
+			if utf8.RuneStart(buf[cut-n]) {
+				return cut - n
+			}
+		}
+	}
+	return cut
+}
+
+// flushText emits the short partial as one trimmed line.
+func (a *agentStream) flushText() {
+	if len(a.secret) > 0 {
+		a.textPend = bytes.ReplaceAll(a.textPend, a.secret, []byte(redactedMark))
+	}
+	a.takeText(true)
+	if s := strings.TrimSpace(string(a.textPend)); s != "" {
+		a.emit(a.text, s)
+	}
+	a.textPend = nil
+}
+
+// Flush handles a trailing line with no newline, so a final `end` on a stream
+// that does not end in \n is still recorded. Pending prose is emitted after
+// that line is parsed: a trailing text event still joins the partial, and a
+// trailing end / max_turns_reached / error flushes inside handle before its
+// callback or stderr write.
+func (a *agentStream) Flush() {
+	if len(a.pend) > 0 {
+		line := a.pend
+		a.pend = nil
+		a.handle(line)
+	}
+	a.flushText()
 }
 
 func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, worktrees []WorktreeBinding, opts *CodingAgentOpts) string {
@@ -195,12 +605,18 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 			wtLines = append(wtLines, "- "+w.Repo+": EDIT ONLY "+w.WorktreeAbs+" (branch "+w.Branch+"); NEVER "+w.PrimaryAbs)
 		}
 	}
+	// A job profile denies its own cwd/.grok (it holds the profile), so cwd is
+	// writable except there.
+	cwdWrite := "cwd (" + handoffAbs + ")"
+	if opts != nil && opts.SandboxProfile != "" {
+		cwdWrite = "cwd (" + handoffAbs + ") except its .grok/ (the locked job sandbox profile — no read or write)"
+	}
 	var sandboxNotes []string
 	if sandbox == "workspace" {
 		sandboxNotes = []string{
 			"SANDBOX: --sandbox workspace (App Settings).",
 			"- Read: host filesystem (iOS Simulator, Xcode, simctl data allowed).",
-			"- Write: cwd (" + handoffAbs + "), ~/.grok/, and temp only.",
+			"- Write: " + cwdWrite + ", ~/.grok/, and temp only.",
 			"- Product code: edit only under cwd/worktrees/…",
 			"- Visual check / fix screenshots: capture under cwd/fix-evidence/<DEF-id>/fix-01.png (handoff-writable).",
 			"- Inventory root " + defectsRoot + " is readable — open report + **historical fix evidence** paths listed in BRIEF.md.",
@@ -209,7 +625,7 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 		sandboxNotes = []string{
 			"SANDBOX: --sandbox strict / restrict (App Settings).",
 			"- Read: cwd + system paths only (no ~/Library Simulator data).",
-			"- Write: cwd (" + handoffAbs + "), ~/.grok/, and temp.",
+			"- Write: " + cwdWrite + ", ~/.grok/, and temp.",
 			"- Product code: edit only under cwd/worktrees/…",
 			"- Historical fix evidence may be unreadable under strict if paths are outside cwd — prefer workspace sandbox for visual history.",
 			"- Inventory updates under " + defectsRoot + " may be blocked; write new proof to handoff fix-evidence/.",
@@ -298,6 +714,55 @@ func buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox string, wo
 	return strings.Join(parts, "\n")
 }
 
+// filterInheritedEnv drops DD_TEST_ACCOUNT_PASSWORD and any extra names from
+// the host environment before a coding agent is spawned.
+// FilterInheritedEnv drops DD_TEST_ACCOUNT_PASSWORD and any extra names.
+// Verify commands and the toolchain probe use the same list as the agent.
+func FilterInheritedEnv(environ, extra []string) []string {
+	return filterInheritedEnv(environ, extra)
+}
+
+// dropListedEnv removes strip-list keys after the child env is fully built.
+// keep retains the test job's intentional DD_TEST_ACCOUNT_PASSWORD assignment.
+func dropListedEnv(environ, strip []string, keep map[string]bool) []string {
+	drop := map[string]bool{}
+	for _, name := range strip {
+		if name != "" && !keep[name] {
+			drop[name] = true
+		}
+	}
+	if len(drop) == 0 {
+		return environ
+	}
+	out := make([]string, 0, len(environ))
+	for _, e := range environ {
+		key, _, ok := strings.Cut(e, "=")
+		if ok && drop[key] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func filterInheritedEnv(environ, extra []string) []string {
+	drop := map[string]bool{"DD_TEST_ACCOUNT_PASSWORD": true}
+	for _, name := range extra {
+		if name != "" {
+			drop[name] = true
+		}
+	}
+	out := make([]string, 0, len(environ))
+	for _, e := range environ {
+		key, _, ok := strings.Cut(e, "=")
+		if !ok || drop[key] {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 // StartCodingAgent execs the resolved bin. Empty worktrees refuse spawn.
 // sandbox is the app grok_sandbox setting; empty falls back to strict.
 // opts may carry toolchain env, a job-scoped sandbox profile name, and prompt
@@ -320,22 +785,52 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		sandboxArg = opts.SandboxProfile
 	}
 	prompt := buildBatchFixCLIPrompt(handoffAbs, batchID, defectsRoot, sandbox, worktrees, opts)
-	maxTurns := env.EnvDrainer("GROK_BATCH_MAX_TURNS")
+	if opts != nil && opts.Prompt != "" {
+		prompt = opts.Prompt
+	}
+	// App Settings wins, then either env spelling, then the built-in default.
+	// A Flutter repo burns turns far faster than a Node one — each pub get,
+	// analyze and test is a turn — so this is per app, not per install.
+	maxTurns := ""
+	if opts != nil && opts.MaxTurns > 0 {
+		maxTurns = strconv.Itoa(opts.MaxTurns)
+	}
+	if maxTurns == "" {
+		maxTurns = env.EnvDrainer("GROK_BATCH_MAX_TURNS")
+	}
 	if maxTurns == "" {
 		maxTurns = os.Getenv("GROK_BATCH_MAX_TURNS")
 	}
 	if maxTurns == "" {
-		maxTurns = "80"
+		maxTurns = defaultBatchMaxTurns
 	}
-	args := []string{
-		"-p", prompt,
+	// Iteration 2+ resumes the session for this cwd with the fixed continue
+	// prompt. Everything else about the argv is identical, so the sandbox and
+	// turn budget cannot drift between iterations.
+	args := []string{}
+	promptArg := prompt
+	cont := ContinuePrompt
+	if opts != nil && opts.ContinuePrompt != "" {
+		cont = opts.ContinuePrompt
+	}
+	if opts != nil && opts.ResumeSession != "" {
+		promptArg = cont
+		args = append(args, "-r", opts.ResumeSession)
+	} else if opts != nil && opts.Continue {
+		promptArg = cont
+		args = append(args, "-c")
+	}
+	args = append(args,
+		"-p", promptArg,
 		"--cwd", handoffAbs,
 		"--sandbox", sandboxArg,
 		"--always-approve",
 		"--max-turns", maxTurns,
-		"--output-format", "plain",
+		// streaming-json, not plain: plain prints prose at exit and hides
+		// stopReason, so the harness cannot tell turn exhaustion from a finish.
+		"--output-format", "streaming-json",
 		"--verbatim",
-	}
+	)
 	if env.EnvDrainerFlag("GROK_BYPASS_PERMISSIONS") {
 		args = append(args, "--permission-mode", "bypassPermissions")
 	}
@@ -344,6 +839,13 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = handoffAbs
+	// Own process group so descendants die with the iteration. A background
+	// sleep or a swap loop otherwise outlives the exit and can still race
+	// the server's review git.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Descendants inherit the stdout pipe. After the leader exits, Wait must
+	// not block on them; the caller SIGKILLs the group once Wait returns.
+	cmd.WaitDelay = 100 * time.Millisecond
 	wtPaths := make([]string, 0, len(worktrees))
 	for _, w := range worktrees {
 		wtPaths = append(wtPaths, w.WorktreeAbs)
@@ -351,7 +853,14 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 	// SKILL_FORGE_AGENT_ROLE marks the child as the worker end of the
 	// delegation. Never set it on the serve process: a leaked value would tell
 	// a human session started from the same shell that it is a worker.
-	cmd.Env = append(os.Environ(),
+	// Inherited DD_TEST_ACCOUNT_PASSWORD and any app env: secret names are
+	// removed here. ExtraEnv may set DD_TEST_ACCOUNT_PASSWORD again for a
+	// test job; a fix job never does.
+	var strip []string
+	if opts != nil {
+		strip = opts.StripEnv
+	}
+	cmd.Env = append(filterInheritedEnv(os.Environ(), strip),
 		"CI=1",
 		"GROK_SANDBOX="+sandboxArg,
 		"SKILL_FORGE_AGENT_ROLE=worker",
@@ -365,22 +874,60 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		}
 	}
 	cmd.Env = append(cmd.Env, "DEFECT_DRAINER_WORKTREES="+strings.Join(wtPaths, ":"))
+	keep := map[string]bool{}
+	if opts != nil {
+		if _, ok := opts.ExtraEnv["DD_TEST_ACCOUNT_PASSWORD"]; ok {
+			keep["DD_TEST_ACCOUNT_PASSWORD"] = true
+		}
+	}
+	cmd.Env = dropListedEnv(cmd.Env, strip, keep)
 	outFwd := newLineForwarder(onStdout)
 	errFwd := newLineForwarder(onStderr)
+	stream := &agentStream{text: outFwd, errs: errFwd}
+	if opts != nil && opts.Secret != "" {
+		sec := []byte(opts.Secret)
+		outFwd.secret = sec
+		errFwd.secret = sec
+		stream.secret = sec
+	}
+	if opts != nil {
+		stream.onEnd = opts.OnEnd
+		stream.onMaxTurns = opts.OnMaxTurns
+	}
 	logf, err := os.OpenFile(handoffAbs+"/agent.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	var stdoutRed, stderrRed *redactWriter
 	if err == nil {
 		var start int64
 		if st, serr := logf.Stat(); serr == nil {
 			start = st.Size()
 		}
 		tee := &cappedWriter{w: logf, n: start, limit: maxAgentLogBytes}
-		cmd.Stdout = io.MultiWriter(tee, outFwd)
-		cmd.Stderr = io.MultiWriter(tee, errFwd)
+		// stdout is NDJSON and goes through the parser, which owns the raw tee.
+		// stderr is plain text and keeps the old path. Each stream redacts on
+		// its own so a secret split across two writes of that stream is caught.
+		var rawOut io.Writer = tee
+		var rawErr io.Writer = tee
+		if opts != nil && opts.Secret != "" {
+			stdoutRed = newRedactWriter(tee, opts.Secret)
+			stderrRed = newRedactWriter(tee, opts.Secret)
+			rawOut = stdoutRed
+			rawErr = stderrRed
+		}
+		stream.raw = rawOut
+		cmd.Stdout = stream
+		cmd.Stderr = io.MultiWriter(rawErr, errFwd)
 	} else {
-		cmd.Stdout = outFwd
+		cmd.Stdout = stream
 		cmd.Stderr = errFwd
 	}
 	flush := func() {
+		if stdoutRed != nil {
+			_ = stdoutRed.Flush()
+		}
+		if stderrRed != nil {
+			_ = stderrRed.Flush()
+		}
+		stream.Flush()
 		outFwd.Flush()
 		errFwd.Flush()
 		if logf != nil {
@@ -392,4 +939,269 @@ func StartCodingAgent(handoffAbs, batchID, defectsRoot string, worktrees []Workt
 		return nil, nil, err
 	}
 	return cmd, flush, nil
+}
+
+// reviewTextLimit matches jobs.harvestFileLimit. A reviewer payload larger
+// than this is rejected whole; the cap here only keeps the collector from
+// growing without bound when the caller does not pass one.
+const reviewTextLimit = 26 << 20
+
+// ReviewAgentOpts is a fresh reviewer spawn. It never resumes a session.
+type ReviewAgentOpts struct {
+	Cwd      string
+	Prompt   string
+	MaxTurns int
+	// TextLimit caps the reassembled assistant text. <= 0 uses reviewTextLimit.
+	TextLimit int
+	// Wall is how long the child may run before it is killed. <= 0 disables
+	// the killer; the jobs orchestrator always passes a positive duration.
+	Wall     time.Duration
+	StripEnv []string
+	OnStdout func(string)
+	OnStderr func(string)
+	// Register runs after Start and before Wait so the caller can publish the
+	// process. The returned func is the single Wait — pass spawnedProc.reap,
+	// because Cmd.Wait must not run twice. Nil uses Cmd.Wait.
+	Register func(cmd *exec.Cmd) (wait func() error)
+}
+
+// ReviewResult is one reviewer process after it has exited. Text is every
+// streaming-json text payload concatenated, in order. Deadline is set when
+// Wall killed the child.
+type ReviewResult struct {
+	Text     string
+	End      AgentEnd
+	Stderr   string
+	TooLarge bool
+	Deadline bool
+	Err      error
+	// ToolEvents are the tool_call and tool_call_update payloads, in order.
+	ToolEvents [][]byte
+}
+
+// StartReviewAgent execs a reviewer that cannot resume the implementer.
+// Argv is built here and nowhere else: no -c, no -r, no --resume, sandbox
+// always read-only. The caller creates Cwd (handoff/review/<lens>, never the
+// handoff itself). Findings come back in ReviewResult.Text; this process
+// does not expect the child to write a file.
+func StartReviewAgent(opts ReviewAgentOpts) (ReviewResult, error) {
+	if opts.Cwd == "" {
+		return ReviewResult{}, fmt.Errorf("reviewer cwd is empty")
+	}
+	bin := ResolveGrokBin()
+	if bin == "" {
+		return ReviewResult{}, fmt.Errorf("coding agent binary not found")
+	}
+	maxTurns := opts.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = 8
+	}
+	limit := opts.TextLimit
+	if limit <= 0 {
+		limit = reviewTextLimit
+	}
+	prompt := opts.Prompt
+	if prompt == "" {
+		prompt = "Read REVIEW.md and reply with the findings JSON object it describes."
+	}
+	// Fresh process. Do not add -c, -r, --resume, or --always-approve.
+	// -c resumes the most recent session for this cwd. --always-approve
+	// would let a prompt injected into the implementer's diff read any file
+	// and exfiltrate it: read-only still reads everywhere, and the
+	// child-network block does not hold on macOS. The permission gate stays.
+	args := []string{
+		"-p", prompt,
+		"--cwd", opts.Cwd,
+		"--sandbox", "read-only",
+		"--no-subagents",
+		"--output-format", "streaming-json",
+		"--max-turns", strconv.Itoa(maxTurns),
+		"--verbatim",
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = opts.Cwd
+	// Own process group so a wall or Stop kill reaches git/shell grandchildren.
+	// The implementer spawn does not do this.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(filterInheritedEnv(os.Environ(), opts.StripEnv),
+		"CI=1",
+		"GROK_SANDBOX=read-only",
+		"SKILL_FORGE_AGENT_ROLE=worker",
+	)
+
+	var text strings.Builder
+	var stderr strings.Builder
+	var tools [][]byte
+	tooLarge := false
+	var end AgentEnd
+	outFwd := newLineForwarder(opts.OnStdout)
+	errFwd := newLineForwarder(func(line string) {
+		stderr.WriteString(line)
+		stderr.WriteByte('\n')
+		if opts.OnStderr != nil {
+			opts.OnStderr(line)
+		}
+	})
+	stream := &agentStream{text: outFwd, errs: errFwd}
+	stream.onText = func(s string) {
+		if tooLarge || s == "" {
+			return
+		}
+		if text.Len()+len(s) > limit {
+			tooLarge = true
+			return
+		}
+		text.WriteString(s)
+	}
+	stream.onEnd = func(e AgentEnd) { end = e }
+	stream.onTool = func(raw []byte) { tools = append(tools, raw) }
+
+	logf, logErr := os.OpenFile(filepath.Join(opts.Cwd, "agent.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if logErr == nil {
+		var start int64
+		if st, serr := logf.Stat(); serr == nil {
+			start = st.Size()
+		}
+		tee := &cappedWriter{w: logf, n: start, limit: maxAgentLogBytes}
+		stream.raw = tee
+		cmd.Stdout = stream
+		cmd.Stderr = io.MultiWriter(tee, errFwd)
+	} else {
+		cmd.Stdout = stream
+		cmd.Stderr = errFwd
+	}
+	flush := func() {
+		stream.Flush()
+		outFwd.Flush()
+		errFwd.Flush()
+		if logf != nil {
+			_ = logf.Close()
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		flush()
+		return ReviewResult{}, err
+	}
+	trackReviewProc(cmd)
+	defer forgetReviewProc(cmd)
+	wait := cmd.Wait
+	if opts.Register != nil {
+		if w := opts.Register(cmd); w != nil {
+			wait = w
+		}
+	}
+	var killed atomic.Bool
+	var timer *time.Timer
+	killedDone := make(chan struct{})
+	if opts.Wall > 0 {
+		timer = time.AfterFunc(opts.Wall, func() {
+			if KillReviewProcess(cmd) {
+				killed.Store(true)
+			}
+			close(killedDone)
+		})
+	}
+	waitErr := wait()
+	// The reaped flag is set before any late wall callback. A kill that
+	// loses the race with Wait must not signal a pid the kernel has reused.
+	markReviewReaped(cmd)
+	if reviewAfterReapHook != nil {
+		reviewAfterReapHook(cmd)
+	}
+	if timer != nil && !timer.Stop() {
+		<-killedDone
+	}
+	flush()
+	res := ReviewResult{
+		Text:       text.String(),
+		End:        end,
+		Stderr:     stderr.String(),
+		TooLarge:   tooLarge,
+		Err:        waitErr,
+		ToolEvents: tools,
+	}
+	if killed.Load() && waitErr != nil {
+		res.Deadline = true
+	}
+	return res, nil
+}
+
+// reviewProcGate is one reviewer's reap state. Kill paths share it so a
+// wall callback that runs after Wait does not signal a reused process group.
+type reviewProcGate struct {
+	mu     sync.Mutex
+	reaped bool
+}
+
+var reviewProcs sync.Map // *exec.Cmd -> *reviewProcGate
+
+// reviewAfterReapHook runs after Wait has returned and the reaped flag is
+// set. Tests use it to deliver the wall callback late.
+var reviewAfterReapHook func(cmd *exec.Cmd)
+
+// signalReviewGroup is the process-group SIGKILL. Tests replace it.
+var signalReviewGroup = func(pid int) error {
+	return syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+func trackReviewProc(cmd *exec.Cmd) {
+	reviewProcs.Store(cmd, &reviewProcGate{})
+}
+
+func forgetReviewProc(cmd *exec.Cmd) {
+	reviewProcs.Delete(cmd)
+}
+
+func markReviewReaped(cmd *exec.Cmd) {
+	v, ok := reviewProcs.Load(cmd)
+	if !ok {
+		return
+	}
+	st := v.(*reviewProcGate)
+	st.mu.Lock()
+	st.reaped = true
+	st.mu.Unlock()
+}
+
+// KillImplementerGroup SIGKILLs an implementer process group after its leader
+// has been reaped. Children keep the group id alive, so the kernel will not
+// reuse it while they exist. signal 0 skips a group that is already empty.
+// The residual race is the gap between that probe and the SIGKILL: the last
+// member can exit and the id can be reused before the kill lands.
+func KillImplementerGroup(pid int) {
+	if pid <= 0 {
+		return
+	}
+	v, _ := implGroupMu.LoadOrStore(pid, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := syscall.Kill(-pid, 0); err == syscall.ESRCH {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+var implGroupMu sync.Map // pid -> *sync.Mutex
+
+// KillReviewProcess SIGKILLs the reviewer's process group. It returns false
+// once the child has been reaped, and sends nothing. StartReviewAgent puts
+// the child in its own group; killing only the leader leaves git and shell
+// grandchildren behind. Do not use this on the implementer.
+func KillReviewProcess(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+	if v, ok := reviewProcs.Load(cmd); ok {
+		st := v.(*reviewProcGate)
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		if st.reaped {
+			return false
+		}
+		_ = signalReviewGroup(cmd.Process.Pid)
+		return true
+	}
+	_ = signalReviewGroup(cmd.Process.Pid)
+	return true
 }

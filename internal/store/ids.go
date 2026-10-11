@@ -15,6 +15,8 @@ const (
 	safeAppIDPat  = `^app_[a-f0-9]{16}$`
 	safeBatchPat  = `^BATCH-[A-Za-z0-9][A-Za-z0-9._-]{0,120}$`
 	safeJobIDPat  = `(?i)^bjob_[a-z0-9_]+$`
+	safePlanIDPat = `^TPLAN-[A-Za-z0-9][A-Za-z0-9._-]{0,120}$`
+	safeRunIDPat  = `^TRUN-[A-Za-z0-9][A-Za-z0-9._-]{0,120}$`
 	gitRefNamePat = `^[A-Za-z0-9._/-]{1,120}$`
 )
 
@@ -23,11 +25,22 @@ var (
 	safeAppIDRe  = regexp.MustCompile(safeAppIDPat)
 	safeBatchRe  = regexp.MustCompile(safeBatchPat)
 	safeJobIDRe  = regexp.MustCompile(safeJobIDPat)
+	safePlanIDRe = regexp.MustCompile(safePlanIDPat)
+	safeRunIDRe  = regexp.MustCompile(safeRunIDPat)
 	gitRefNameRe = regexp.MustCompile(gitRefNamePat)
 )
 
-// IsSafeID is the defect/evidence id gate.
+// IsSafeID is the defect id gate. Do not widen it for plans or runs.
 func IsSafeID(id string) bool { return safeIDRe.MatchString(id) }
+
+// IsSafePlanID gates test plan ids.
+func IsSafePlanID(id string) bool { return safePlanIDRe.MatchString(id) }
+
+// IsSafeRunID gates test run ids.
+func IsSafeRunID(id string) bool { return safeRunIDRe.MatchString(id) }
+
+// IsEvidenceOwnerID is a defect id or a test run id. Evidence files live under either.
+func IsEvidenceOwnerID(id string) bool { return IsSafeID(id) || IsSafeRunID(id) }
 
 // IsSafeAppID is app_[16 hex].
 func IsSafeAppID(id string) bool { return safeAppIDRe.MatchString(id) }
@@ -168,6 +181,28 @@ func MakeDefectID(comment string, now time.Time) string {
 	slug := Slugify(comment, 40)
 	suffix := randomBase36(4)
 	return fmt.Sprintf("DEF-%04d%02d%02d-%s-%s", y, int(m), d, slug, suffix)
+}
+
+// MakePlanID mirrors MakeDefectID with a TPLAN prefix and the plan title.
+func MakePlanID(title string, now time.Time) string {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	y, m, d := now.Date()
+	slug := Slugify(title, 40)
+	suffix := randomBase36(4)
+	return fmt.Sprintf("TPLAN-%04d%02d%02d-%s-%s", y, int(m), d, slug, suffix)
+}
+
+// MakeRunID is TRUN-YYYYMMDD- plus 8 lowercase hex digits. Date is the host local calendar.
+func MakeRunID(now time.Time) string {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	y, m, d := now.Date()
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("TRUN-%04d%02d%02d-%s", y, int(m), d, hex.EncodeToString(b[:]))
 }
 
 func randomBase36(n int) string {

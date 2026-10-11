@@ -30,7 +30,7 @@ The **Where** column names the Go control plane, which is the only implementatio
 | 2 | Baseline run before the agent, so pre-existing red is attributable | `internal/jobs/verify.go` (`judgeVerification`), `internal/jobs/jobs.go` |
 | 3 | Acceptance criteria from the defect body rendered in BRIEF.md | `internal/jobs/brief.go` (`AcceptanceCriteria`) |
 | 4 | Agent toolchain: pinned SDK cloned into the handoff | `internal/jobs/toolchain.go` |
-| 5 | Job-scoped Simulator write grant | `internal/jobs/sandbox.go` |
+| 5 | Job-scoped Simulator write grant; denies its own `.grok` and is byte-checked before every iteration | `internal/jobs/sandbox.go` |
 | 6 | BRIEF names each worktree's own contract files (AGENTS.md / CLAUDE.md) | `internal/jobs/brief.go` (`contractFilesIn`) |
 | 7 | Diff-hygiene measurement: how much of the diff is reformatting | `internal/jobs/diff_hygiene.go` |
 | 8 | Worker role: BRIEF declares it, `PROCESS.md` is the contract, `SKILLS.md` lists per-worktree skill paths, `SKILL_FORGE_AGENT_ROLE=worker` on the child (PR-H1, Go only) | `jobs/worker_files.go`, `jobs/brief.go`, `git/spawn.go` |
@@ -72,12 +72,73 @@ Ported on `backend-go` `dev` (`c530772`, 2026-08-19): verification runner,
 baseline/verdict, harvest gate, diff hygiene, toolchain, job-scoped sandbox,
 and BRIEF.md. Live process is `defect-drainer serve`. TS `backend/` is rollback.
 
-## Not done, and why
+## Shipped
 
-### No second-pass reviewer
-Diffing a fix against the defect's acceptance criteria and the repo's
-conventions would have caught most of the seven cross-check findings without
-either agent getting smarter.
+### Independent reviewer (PR-H3)
+The implementer's exit, a screenshot, and a green verify run do not say the
+fix meets the acceptance criteria. After verify and diff hygiene, a fix job
+spawns one fresh read-only reviewer per lens (`spec`, `security`, `code`,
+`tests`, and `ui` only when a worktree path looks like a widget or component).
+Critical or high findings, a lens that does not return a valid findings
+payload, or a lens that never shows a completed `git diff` of a worktree
+(`no-read-evidence` — file reads do not count), block resolve the same way a
+verification `regression` or `blocked` does: images and notes are still
+imported, the defect stays open, and the harvest outcome is `review_blocked`.
+Medium and low findings are advisory. The model does not get to set `ok`.
+
+A failed implementer (non-zero exit that is not turn exhaustion) and a
+cancelled job do not spawn a reviewer and do not resolve. `DEFECT_DRAINER_REVIEW=0`
+skips the pass with a warning when there is something to review; there is no
+Settings toggle. No diff against `diffBase` leaves the defect open even when
+fix-notes exist and even when `REVIEW=0`: harvest records `nothing to review`.
+A line `UNFIXED: <id>` in `NOTES.md` is the same kind of
+refusal for that one defect. A missing `NOTES.md` is not a decline. A
+`NOTES.md` that is present but cannot be read blocks resolve for every
+defect in the job. Test-run jobs are out of this gate.
+
+Before the first lens and again after the last, DD records a pure-Go manifest
+and leaves the worktree as it found it. Paths come from `git ls-files -z
+--cached --others --exclude-standard` under the pinned `GIT_DIR` (ignored
+trees stay out). Each path is `Lstat`'d without following a symlink: type,
+mode, size, SHA-256 of a regular file, `Readlink` text, or missing. HEAD is
+`rev-parse` plus `symbolic-ref -q`. Any difference makes the review not ok,
+with error `worktree changed during review: <repo>: <first differing path or
+HEAD>`, logged at error, and resolve stays blocked. A repo present in only
+one manifest is a change. An empty worktree path or a `.git` that cannot be
+read fails the capture before any lens. Over 200k paths or 2 GiB of
+regular-file bytes fails closed; the size is checked before the file is
+opened, and a file that grows past the remaining budget during the read
+fails the same way. Restore used to run `checkout-index -f`
+and `clean -fd` as the server; a `setsid` descendant could escape the
+process-group kill and swap the worktree during that write. Detection removes
+the write. The implementer is buggy, not malicious: the checks catch mistakes
+and accidents. Hostile-implementer server RCE is a known limitation — verify
+commands already run implementer code on the server, and server-side worktree
+git is not sandboxed — and belongs to a separate task.
+
+The manifest git refuses a worktree that is no longer the directory recorded
+before spawn, and a `.git` file that no longer names the git dir recorded then
+(which has to be that repo's `.git/worktrees/…` for a linked worktree).
+`GIT_DIR` and `GIT_WORK_TREE` are pinned and inherited `GIT_*` variables are
+stripped. `core.hooksPath=/dev/null` (a directory under the handoff can be
+seeded). Global and system git config are blanked. Filter drivers come from
+`git config --includes --get-regexp '^filter\.'` without `--local`, so includes
+and `config.worktree` count; the id runs from after `filter.` to the last dot
+(`filter.a.b.clean` is `a.b`). `clean`, `smudge`, and `process` are cleared
+and `required` is false, so a worktree `.gitattributes` cannot run one on the
+no-diff check. The implementer is a process group; after it is reaped, and
+before the manifest, a non-empty group is SIGKILLed so a background child is
+gone before those commands.
+
+`suggested_fix` is not executed. Product shell is the operator's
+`verify_commands`. Review also runs git to read the worktree.
+
+**Host dependency.** `grok --sandbox read-only` will not start when
+`/var/run/docker.sock` is a symlink. The lens error names that cause and the
+resolve stays blocked. Removing the symlink (and not letting a container
+runtime's Docker shim recreate it) is required for the reviewer to run.
+
+## Not done, and why
 
 ### Detector re-run gate (parked)
 Tag a verify command with the defect `source` that filed it, so the check that
