@@ -5,7 +5,7 @@
 
 Go control-plane binary (`defect-drainer`) — **the** harness API runtime. Design: `../docs/go-backend.md`. Framing: `docs/workflow.md`. Operator runbook (job actions, safe restart, orphaned agents): `docs/operating.md`. Rationale for the verification gates: `docs/verification-hardening.md`. The TS `backend/` tree was retired and deleted on 2026-09-22; its history lives in the `defect-drainer-backend` remote.
 
-- Inventory SSOT: `.data/defect-drainer.db` and `.data/evidence` (this module) — do not invent a second store
+- Inventory SSOT: SQLite `.data/defect-drainer.db` by default, or optional Postgres (`DEFECT_DRAINER_DB_DRIVER=postgres`; this process runs no DDL), plus `.data/evidence` (this module) — do not invent a second store
 - Test plans and runs (manual execution, step evidence, app `test_accounts`, filing a defect from a failed step, retest grid, and `execute:"agent"` test-run jobs): `README.md` → "Test plans and runs (API)" and "Test-run jobs". A test job is `kind:"test_run"` with detached worktrees, no batch row, no shipping, and the account password only via `DD_TEST_ACCOUNT_PASSWORD` (redacted). Fix-job children also drop that variable and every app `env:` secret name.
 - One writer per data dir: `syscall.Flock` takes `LOCK_EX|LOCK_NB` on `{DATA}/defect-drainer.lock` before listen (the retired TS tree used `koffi`/`libc.flock` on the same file)
 - Restarting `serve` is not free: spawned coding-agent children live in-process (`procs[jobID]`) and the signal path is a bare `srv.Close()` with no drain (`cmd/defect-drainer/main.go`). Check `GET /api/batches` for a job still `running` / `waiting_external` before killing — a restart mid-job orphans its agent child (holding a worktree) and loses the in-memory job state. The replacement cannot bind until the old process releases the lock, so stop, wait for the port, then start; never start a second one alongside. Procedure, including finding and killing orphaned agents: `docs/operating.md` → Restarting the backend
@@ -15,8 +15,8 @@ Go control-plane binary (`defect-drainer`) — **the** harness API runtime. Desi
 - Product language: agent harness / coding agent / workflow / inventory
 - Cross-repo plans: `/Users/joe/workspace/defect-drainer/tasks/todo.md`
 - Local tasks: `tasks/todo.md` (this package only)
-- Run: `go test ./...`; `go run ./cmd/defect-drainer serve` (or `make serve`) → `127.0.0.1:8788` after lock + DB open. DATA defaults to this module's `.data` when that DB exists. `.env` is read from the module root (`backend-go/.env`), not the umbrella.
-- Only extra module: pinned `modernc.org/sqlite`. `CGO_ENABLED=0`. Flock is `syscall.Flock`.
+- Run: `go test ./...`; `go run ./cmd/defect-drainer serve` (or `make serve`) → `127.0.0.1:8788` after lock + DB open. DATA defaults to this module's `.data` when `defect-drainer.db` exists. Postgres mode does not create that file, so set `DEFECT_DRAINER_DATA`. `.env` is read from the module root (`backend-go/.env`), not the umbrella.
+- DB drivers: pinned `modernc.org/sqlite` (default) and pure-Go `github.com/jackc/pgx/v5` (optional Postgres, `?` rebound to `$n`). `CGO_ENABLED=0`. Flock is `syscall.Flock`.
 
 ## Session ownership (worktree)
 

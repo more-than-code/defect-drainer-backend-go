@@ -215,53 +215,69 @@ func SearchDefects(sqlDB *sql.DB, q, appID string, limit int) (hits []DefectHit,
 		}
 	}
 	ftsQuery := strings.Join(parts, " ")
-	var rows *sql.Rows
-	var err error
-	if appID != "" {
-		rows, err = sqlDB.Query(`SELECT d.id, d.app_id, d.title, d.summary, d.severity, d.status, d.area, d.bucket,
+	// FTS5 (snippet/MATCH) is SQLite-only. Postgres uses the LIKE fallback with ILIKE.
+	if !db.IsPostgres(sqlDB) {
+		var rows *sql.Rows
+		var err error
+		if appID != "" {
+			rows, err = sqlDB.Query(`SELECT d.id, d.app_id, d.title, d.summary, d.severity, d.status, d.area, d.bucket,
                snippet(defects_fts, 2, '[', ']', '…', 12) AS snippet
          FROM defects_fts
          JOIN defects d ON d.id = defects_fts.id
          WHERE defects_fts MATCH ? AND d.app_id = ?
          ORDER BY rank
          LIMIT ?`, ftsQuery, appID, limit)
-	} else {
-		rows, err = sqlDB.Query(`SELECT d.id, d.app_id, d.title, d.summary, d.severity, d.status, d.area, d.bucket,
+		} else {
+			rows, err = sqlDB.Query(`SELECT d.id, d.app_id, d.title, d.summary, d.severity, d.status, d.area, d.bucket,
                snippet(defects_fts, 2, '[', ']', '…', 12) AS snippet
          FROM defects_fts
          JOIN defects d ON d.id = defects_fts.id
          WHERE defects_fts MATCH ?
          ORDER BY rank
          LIMIT ?`, ftsQuery, limit)
-	}
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var h DefectHit
-			var snip sql.NullString
-			if err := rows.Scan(&h.ID, &h.AppID, &h.Title, &h.Summary, &h.Severity, &h.Status, &h.Area, &h.Bucket, &snip); err == nil {
-				h.Snippet = snip.String
-				hits = append(hits, h)
-			}
 		}
-		return hits, "fts"
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var h DefectHit
+				var snip sql.NullString
+				if err := rows.Scan(&h.ID, &h.AppID, &h.Title, &h.Summary, &h.Severity, &h.Status, &h.Area, &h.Bucket, &snip); err == nil {
+					h.Snippet = snip.String
+					hits = append(hits, h)
+				}
+			}
+			return hits, "fts"
+		}
 	}
+	return searchLike(sqlDB, q, appID, limit)
+}
+
+// searchLike is the FTS fallback. Postgres LIKE is case-sensitive, so that
+// driver uses ILIKE. The mode string stays "like" (API contract).
+func searchLike(sqlDB *sql.DB, q, appID string, limit int) (hits []DefectHit, mode string) {
+	hits = []DefectHit{}
 	like := "%" + q
 	if len(like) > 82 {
 		like = "%" + q[:80] + "%"
 	} else {
 		like = "%" + q + "%"
 	}
+	op := "LIKE"
+	if db.IsPostgres(sqlDB) {
+		op = "ILIKE"
+	}
+	var rows *sql.Rows
+	var err error
 	if appID != "" {
 		rows, err = sqlDB.Query(`SELECT id, app_id, title, summary, severity, status, area, bucket
              FROM defects
              WHERE app_id = ?
-               AND (title LIKE ? OR summary LIKE ? OR body LIKE ?)
+               AND (title `+op+` ? OR summary `+op+` ? OR body `+op+` ?)
              ORDER BY updated_at DESC LIMIT ?`, appID, like, like, like, limit)
 	} else {
 		rows, err = sqlDB.Query(`SELECT id, app_id, title, summary, severity, status, area, bucket
              FROM defects
-             WHERE title LIKE ? OR summary LIKE ? OR body LIKE ?
+             WHERE title `+op+` ? OR summary `+op+` ? OR body `+op+` ?
              ORDER BY updated_at DESC LIMIT ?`, like, like, like, limit)
 	}
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/joe/defect-drainer-go/internal/api"
+	"github.com/joe/defect-drainer-go/internal/db"
 	"github.com/joe/defect-drainer-go/internal/env"
 	"github.com/joe/defect-drainer-go/internal/paths"
 )
@@ -84,8 +85,12 @@ func runServe() int {
 		fmt.Fprintf(os.Stderr, "serve: listen: %v\n", err)
 		return 1
 	}
+	dbShown := paths.DbPath(app.Roots.DataRoot)
+	if db.IsPostgres(app.DB) {
+		dbShown = "postgres"
+	}
 	fmt.Printf("defect-drainer http://%s  evidenceRoot=%s  db=%s\n",
-		ln.Addr().String(), app.Roots.DefectsRoot, paths.DbPath(app.Roots.DataRoot))
+		ln.Addr().String(), app.Roots.DefectsRoot, dbShown)
 
 	srv := &http.Server{Handler: app.Handler}
 	errCh := make(chan error, 1)
@@ -135,7 +140,7 @@ func usage() string {
 	return `defect-drainer — agent-harness control plane
 
 Usage:
-  defect-drainer serve         control plane (lock + SQLite + HTTP)
+  defect-drainer serve         control plane (lock + SQLite or Postgres + HTTP)
   defect-drainer healthcheck   GET /health on HOST:PORT (exit 0 iff 200 and ok:true)
   defect-drainer worker        reserved (not implemented)
   defect-drainer version       print build version

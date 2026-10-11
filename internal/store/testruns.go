@@ -860,6 +860,42 @@ func (s *Store) removeEvidenceFiles(rels []string) {
 	}
 }
 
+// bareStep is a pass step whose evidence_json holds no array elements. Raw is
+// the text that was checked, so the update can skip a row edited since.
+type bareStep struct {
+	Key string
+	Raw string
+}
+
+// passStepsWithoutEvidence returns the pass steps whose evidence_json has no
+// array elements: an empty array or a non-array value, as SQLite's
+// json_array_length(evidence_json) = 0 decided. The check runs in Go because
+// json_array_length does not accept TEXT on Postgres. Only strict JSON is
+// supported; the app writes evidence_json with encoding/json. Malformed JSON,
+// including JSON5 that SQLite would accept, is an error.
+func passStepsWithoutEvidence(tx *sql.Tx, runID string) ([]bareStep, error) {
+	rows, err := tx.Query(`SELECT step_key, evidence_json FROM test_step_results WHERE run_id = ? AND status = 'pass'`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bare []bareStep
+	for rows.Next() {
+		var b bareStep
+		if err := rows.Scan(&b.Key, &b.Raw); err != nil {
+			return nil, err
+		}
+		v, err := db.DecodeStrictJSON(b.Raw)
+		if err != nil {
+			return nil, fmt.Errorf("step %s: evidence_json: %w", b.Key, err)
+		}
+		if arr, ok := v.([]any); !ok || len(arr) == 0 {
+			bare = append(bare, b)
+		}
+	}
+	return bare, rows.Err()
+}
+
 // FinishRun moves in_progress to awaiting_review and converts pass-without-evidence to unverified.
 func FinishRun(sqlDB *sql.DB, runID string) (TestRun, error) {
 	var out TestRun
@@ -871,10 +907,16 @@ func FinishRun(sqlDB *sql.DB, runID string) (TestRun, error) {
 		if run.Status != "in_progress" {
 			return conflictErr("run is not in_progress")
 		}
-		ts := db.NowIso()
-		if _, err := tx.Exec(`UPDATE test_step_results SET status = 'unverified', updated_at = ?
-			WHERE run_id = ? AND status = 'pass' AND json_array_length(evidence_json) = 0`, ts, runID); err != nil {
+		bare, err := passStepsWithoutEvidence(tx, runID)
+		if err != nil {
 			return err
+		}
+		ts := db.NowIso()
+		for _, b := range bare {
+			if _, err := tx.Exec(`UPDATE test_step_results SET status = 'unverified', updated_at = ?
+				WHERE run_id = ? AND step_key = ? AND status = 'pass' AND evidence_json = ?`, ts, runID, b.Key, b.Raw); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.Exec(`UPDATE test_runs SET status = 'awaiting_review', finished_at = ?, updated_at = ? WHERE id = ?`,
 			ts, ts, runID); err != nil {

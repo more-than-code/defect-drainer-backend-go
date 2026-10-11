@@ -429,7 +429,9 @@ func (s *Store) Delete(id string, wipeEvidence bool) (bool, error) {
 	if _, err := s.DB.Exec(`DELETE FROM defects WHERE id = ?`, id); err != nil {
 		return false, err
 	}
-	_, _ = s.DB.Exec(`DELETE FROM defects_fts WHERE id = ?`, id)
+	if !db.IsPostgres(s.DB) {
+		_, _ = s.DB.Exec(`DELETE FROM defects_fts WHERE id = ?`, id)
+	}
 	if wipeEvidence {
 		_ = os.RemoveAll(filepath.Join(paths.EvidenceDir(s.DefectsRoot), id))
 	}
@@ -508,7 +510,11 @@ func evidenceExt(filename string) string {
 }
 
 // SyncDefectFTS updates the FTS row; errors are swallowed by callers like TS.
+// Postgres has no defects_fts table; this is a no-op there.
 func SyncDefectFTS(sqlDB *sql.DB, rec DefectRecord) error {
+	if db.IsPostgres(sqlDB) {
+		return nil
+	}
 	_, err := sqlDB.Exec(`DELETE FROM defects_fts WHERE id = ?`, rec.ID)
 	if err != nil {
 		return err

@@ -379,3 +379,114 @@ func isOp(err error, status int) bool {
 	var op *OpError
 	return errors.As(err, &op) && op.Status == status
 }
+
+// TestFinishEvidenceCheckMatchesJSONArrayLength pins the evidence check that
+// FinishRun used to do with SQLite's json_array_length(evidence_json) = 0, for
+// strict JSON.
+func TestFinishEvidenceCheckMatchesJSONArrayLength(t *testing.T) {
+	st := newPlanStore(t)
+	appID := SeededTutoredWebappAppID
+	cases := map[string]struct {
+		raw  string
+		want string
+	}{
+		"empty":   {raw: `[]`, want: "unverified"},
+		"spaced":  {raw: ` [ ] `, want: "unverified"},
+		"object":  {raw: `{"a":1}`, want: "unverified"},
+		"scalar":  {raw: `"x"`, want: "unverified"},
+		"null":    {raw: `null`, want: "unverified"},
+		"one":     {raw: `["evidence/r/s-one-01.png"]`, want: "pass"},
+		"nonstrs": {raw: `[1]`, want: "pass"},
+		"nested":  {raw: `[[]]`, want: "pass"},
+		"bignum":  {raw: `[1e309]`, want: "pass"},
+	}
+	var keys []string
+	for key := range cases {
+		keys = append(keys, key)
+	}
+	run := newPassRun(t, st, appID, "finish-json", keys)
+	for key, c := range cases {
+		addPassStep(t, st, run, key, c.raw)
+	}
+	done, err := FinishRun(st.DB, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, s := range done.Steps {
+		seen[s.Key] = true
+		if want := cases[s.Key].want; s.Status != want {
+			t.Errorf("%s: status %q, want %q", s.Key, s.Status, want)
+		}
+	}
+	for key := range cases {
+		if !seen[key] {
+			t.Errorf("%s: step missing from finished run", key)
+		}
+	}
+}
+
+// TestFinishRejectsMalformedEvidenceJSON covers malformed JSON and JSON5 that
+// SQLite would accept. Only strict JSON is supported, so finishing fails and
+// the whole transaction rolls back, including a sibling step without evidence.
+func TestFinishRejectsMalformedEvidenceJSON(t *testing.T) {
+	for name, raw := range map[string]string{
+		"truncated":      `[`,
+		"json5-trailing": `[1,]`,
+		"extra-bracket":  `[]]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newPlanStore(t)
+			run := newPassRun(t, st, SeededTutoredWebappAppID, "finish-bad", []string{"bad", "bare"})
+			addPassStep(t, st, run, "bad", raw)
+			addPassStep(t, st, run, "bare", `[]`)
+			_, err := FinishRun(st.DB, run)
+			if err == nil || !strings.Contains(err.Error(), "malformed JSON") {
+				t.Fatalf("finish with evidence_json %q: %v", raw, err)
+			}
+			got, err := loadRun(st.DB, run, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != "in_progress" || len(got.Steps) != 2 {
+				t.Fatalf("rolled back %+v", got)
+			}
+			for _, s := range got.Steps {
+				if s.Status != "pass" {
+					t.Fatalf("%s: status %q after failed finish", s.Key, s.Status)
+				}
+			}
+		})
+	}
+}
+
+// newPassRun creates an in_progress manual run on a plan with the given step keys.
+func newPassRun(t *testing.T, st *Store, appID, key string, stepKeys []string) string {
+	t.Helper()
+	var steps []PlanStepIn
+	for _, k := range stepKeys {
+		steps = append(steps, PlanStepIn{Key: k, Action: k})
+	}
+	plan, err := UpsertPlan(st.DB, UpsertPlanInput{AppID: appID, Key: key, Title: key, Steps: steps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := CreateRun(st.DB, CreateRunInput{AppID: appID, PlanID: plan.Plan.ID, Execute: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return run.ID
+}
+
+// addPassStep marks a step pass and sets its evidence_json to raw.
+func addPassStep(t *testing.T, st *Store, runID, key, raw string) {
+	t.Helper()
+	pass := "pass"
+	if _, err := PatchRunStep(st.DB, runID, key, &pass, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB.Exec(`UPDATE test_step_results SET evidence_json = ? WHERE run_id = ? AND step_key = ?`,
+		raw, runID, key); err != nil {
+		t.Fatal(err)
+	}
+}

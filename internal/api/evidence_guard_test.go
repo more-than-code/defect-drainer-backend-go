@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -266,5 +267,103 @@ func assertEvidenceDirError(t *testing.T, err error, dir string) {
 	}
 	if strings.Contains(msg, "locked") {
 		t.Fatalf("expected evidence error, got lock error %q", msg)
+	}
+}
+
+// TestBuildEvidenceJSONShapes pins how the startup guard reads evidence_json:
+// non-array JSON references nothing, and malformed JSON refuses to start.
+func TestBuildEvidenceJSONShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr string
+	}{
+		{"object", `{"a":"evidence/x.png"}`, ""},
+		{"null", `null`, ""},
+		{"nested-empty", `[[]]`, "none of the referenced evidence files were found there"},
+		{"malformed", `[`, "malformed JSON"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defects := t.TempDir()
+			data := t.TempDir()
+			cwd := t.TempDir()
+			seedDefect(t, defects, data, cwd, nil, nil)
+			app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, Cwd: cwd, SkipMigrate: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = app.DB.Exec(`UPDATE defects SET evidence_json = ?`, tc.raw)
+			app.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			app, err = api.Build(api.Options{DefectsRoot: defects, DataRoot: data, Cwd: cwd, SkipMigrate: true})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				app.Close()
+				return
+			}
+			if err == nil {
+				app.Close()
+				t.Fatalf("expected error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("got %q, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestBuildEvidenceSampleLimit pins the guard's 50-entry sample: defect
+// evidence first, then defect fix evidence, then test-step evidence.
+func TestBuildEvidenceSampleLimit(t *testing.T) {
+	const id = "DEF-20260924-ev-abcd"
+	missing := func(n int) []string {
+		var out []string
+		for i := 1; i <= n; i++ {
+			out = append(out, fmt.Sprintf("evidence/%s/missing-%02d.png", id, i))
+		}
+		return out
+	}
+	realPath := "evidence/" + id + "/real.png"
+	cases := []struct {
+		name     string
+		evidence []string
+		fix      []string
+		wantOK   bool
+	}{
+		{"real file 51st is outside the sample", append(missing(50), realPath), nil, false},
+		{"real fix file after 49 missing is inside the sample", missing(49), []string{realPath}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defects := t.TempDir()
+			data := t.TempDir()
+			cwd := t.TempDir()
+			seedDefect(t, defects, data, cwd, tc.evidence, tc.fix)
+			dir := filepath.Join(paths.EvidenceDir(defects), id)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "real.png"), []byte("png"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			app, err := api.Build(api.Options{DefectsRoot: defects, DataRoot: data, Cwd: cwd, SkipMigrate: true})
+			if tc.wantOK {
+				if err != nil {
+					t.Fatal(err)
+				}
+				app.Close()
+				return
+			}
+			if err == nil {
+				app.Close()
+				t.Fatal("expected refusal")
+			}
+			assertNoReferencedEvidence(t, err, paths.EvidenceDir(defects))
+		})
 	}
 }

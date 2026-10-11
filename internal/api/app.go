@@ -41,7 +41,9 @@ type Options struct {
 	SkipMigrate bool
 }
 
-// Build resolves roots, flocks, opens SQLite, seeds, and returns the mux.
+// Build resolves roots, flocks, opens the database, seeds, and returns the mux.
+// SQLite is the default. DEFECT_DRAINER_DB_DRIVER=postgres opens Postgres and
+// does not create defect-drainer.db or run DDL.
 func Build(opts Options) (*App, error) {
 	roots, err := paths.Resolve(paths.Options{
 		DefectsRoot: opts.DefectsRoot,
@@ -55,7 +57,7 @@ func Build(opts Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB, err := db.Open(roots.DataRoot)
+	sqlDB, _, err := db.OpenConfigured(roots.DataRoot)
 	if err != nil {
 		lock.Close()
 		return nil, err
@@ -215,7 +217,7 @@ func (a *App) getHealth(w http.ResponseWriter, _ *http.Request) {
 		"resolved":      len(resolved),
 		"defaultAppId":  store.GetDefaultAppID(a.DB),
 		"normalizeMode": resolveNormalizeMode(),
-		"ssot":          "sqlite",
+		"ssot":          ssotName(a.DB),
 		"analytics":     "phase-a",
 		"search":        searchPhase(),
 	})
@@ -325,16 +327,7 @@ func (a *App) getEvidence(w http.ResponseWriter, r *http.Request) {
 // create anything. A directory with none of the referenced files (empty, or nested
 // one level too deep) is not enough. The refusal text stays the same either way.
 func evidenceDirRequired(sqlDB *sql.DB, defectsRoot string) error {
-	var n int
-	err := sqlDB.QueryRow(`
-		SELECT
-		  (SELECT COUNT(*) FROM defects
-		    WHERE json_array_length(evidence_json) > 0
-		       OR json_array_length(fix_evidence_json) > 0)
-		  +
-		  (SELECT COUNT(*) FROM test_step_results
-		    WHERE json_array_length(evidence_json) > 0)
-	`).Scan(&n)
+	n, refs, err := evidenceRefs(sqlDB)
 	if err != nil {
 		return err
 	}
@@ -346,38 +339,82 @@ func evidenceDirRequired(sqlDB *sql.DB, defectsRoot string) error {
 	if err != nil || !st.IsDir() {
 		return fmt.Errorf("evidence directory %s does not exist, but defects reference evidence files; see docs/operating.md", dir)
 	}
-	rows, err := sqlDB.Query(`
-		SELECT value FROM (
-			SELECT value FROM defects, json_each(evidence_json)
-			UNION ALL
-			SELECT value FROM defects, json_each(fix_evidence_json)
-			UNION ALL
-			SELECT value FROM test_step_results, json_each(evidence_json)
-		) LIMIT 50
-	`)
-	if err != nil {
-		return err
-	}
-	var rels []string
-	for rows.Next() {
-		var rel string
-		if err := rows.Scan(&rel); err != nil {
-			rows.Close()
-			return err
-		}
-		rels = append(rels, rel)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	for _, rel := range rels {
-		if referencedEvidenceFile(defectsRoot, rel) {
+	for _, ref := range refs {
+		if rel, ok := ref.(string); ok && referencedEvidenceFile(defectsRoot, rel) {
 			return nil
 		}
 	}
 	return fmt.Errorf("evidence directory %s exists, but none of the referenced evidence files were found there; see docs/operating.md", dir)
+}
+
+// evidenceRefScanLimit is how many referenced evidence entries the startup
+// guard checks on disk.
+const evidenceRefScanLimit = 50
+
+// evidenceRefs returns how many defect and test-step rows have a non-empty
+// evidence array, and the first evidenceRefScanLimit array elements in the
+// order the guard checks them: defect evidence, then defect fix evidence, then
+// test-step evidence. The JSON is decoded in Go because json_array_length and
+// json_each do not accept TEXT on Postgres. Only strict JSON is supported (the
+// app writes these columns with encoding/json). Malformed JSON is an error, and
+// a non-array value references nothing. Only JSON strings are checked as paths:
+// null, number, bool, array and object elements are skipped but still use up
+// one of the evidenceRefScanLimit slots, as they did in the old SQL.
+func evidenceRefs(sqlDB *sql.DB) (int, []any, error) {
+	n, defects, err := scanEvidenceArrays(sqlDB, `SELECT evidence_json, fix_evidence_json FROM defects`, 2)
+	if err != nil {
+		return 0, nil, err
+	}
+	m, steps, err := scanEvidenceArrays(sqlDB, `SELECT evidence_json FROM test_step_results`, 1)
+	if err != nil {
+		return 0, nil, err
+	}
+	refs := append(append(defects[0], defects[1]...), steps[0]...)
+	if len(refs) > evidenceRefScanLimit {
+		refs = refs[:evidenceRefScanLimit]
+	}
+	return n + m, refs, nil
+}
+
+// scanEvidenceArrays runs query, whose cols columns are evidence JSON texts, and
+// returns how many rows had at least one non-empty array plus one element list
+// per column. Each list keeps at most evidenceRefScanLimit elements: the guard
+// checks only the first evidenceRefScanLimit of the concatenated lists, so no
+// column can contribute more than that.
+func scanEvidenceArrays(sqlDB *sql.DB, query string, cols int) (int, [][]any, error) {
+	rows, err := sqlDB.Query(query)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	raws := make([]string, cols)
+	dest := make([]any, cols)
+	for i := range raws {
+		dest[i] = &raws[i]
+	}
+	lists := make([][]any, cols)
+	n := 0
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return 0, nil, err
+		}
+		nonEmpty := false
+		for i, raw := range raws {
+			v, err := db.DecodeStrictJSON(raw)
+			if err != nil {
+				return 0, nil, fmt.Errorf("evidence JSON: %w", err)
+			}
+			arr, _ := v.([]any)
+			nonEmpty = nonEmpty || len(arr) > 0
+			if room := evidenceRefScanLimit - len(lists[i]); room > 0 {
+				lists[i] = append(lists[i], arr[:min(room, len(arr))]...)
+			}
+		}
+		if nonEmpty {
+			n++
+		}
+	}
+	return n, lists, rows.Err()
 }
 
 // referencedEvidenceFile reports whether rel is a regular file under
@@ -402,3 +439,11 @@ func referencedEvidenceFile(defectsRoot, rel string) bool {
 // migrateFilesystemIfNeeded is a no-op until tables are empty and legacy FS exists.
 // Full markdown import lives with the write path; empty-table seed still runs after this.
 func migrateFilesystemIfNeeded(_ *sql.DB, _ string) error { return nil }
+
+// ssotName is the /health "ssot" value: "sqlite" (unchanged default) or "postgres".
+func ssotName(sqlDB *sql.DB) string {
+	if db.IsPostgres(sqlDB) {
+		return "postgres"
+	}
+	return "sqlite"
+}
