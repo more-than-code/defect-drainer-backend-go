@@ -5,8 +5,11 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joe/defect-drainer-go/internal/paths"
@@ -351,6 +354,23 @@ func JSONArray(v []string) string {
 		return "[]"
 	}
 	return string(b)
+}
+
+// DecodeStrictJSON decodes one strict (RFC 8259) JSON value with numbers kept
+// as json.Number, so a number too large for float64 still decodes. Malformed
+// input, JSON5, and trailing data return an error that says "malformed JSON",
+// as SQLite's JSON functions do.
+func DecodeStrictJSON(raw string) (any, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("malformed JSON: %w", err)
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return nil, errors.New("malformed JSON: trailing data after the value")
+	}
+	return v, nil
 }
 
 // ParseJSONArray parses a JSON string array; invalid/non-array → [].
