@@ -40,7 +40,9 @@ type Options struct {
 	SkipMigrate bool
 }
 
-// Build resolves roots, flocks, opens SQLite, seeds, and returns the mux.
+// Build resolves roots, flocks, opens the database, seeds, and returns the mux.
+// SQLite is the default. DEFECT_DRAINER_DB_DRIVER=postgres opens Postgres and
+// does not create defect-drainer.db or run DDL.
 func Build(opts Options) (*App, error) {
 	roots, err := paths.Resolve(paths.Options{
 		DefectsRoot: opts.DefectsRoot,
@@ -54,7 +56,7 @@ func Build(opts Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB, err := db.Open(roots.DataRoot)
+	sqlDB, _, err := db.OpenConfigured(roots.DataRoot)
 	if err != nil {
 		lock.Close()
 		return nil, err
@@ -184,7 +186,7 @@ func (a *App) getHealth(w http.ResponseWriter, _ *http.Request) {
 		"resolved":      len(resolved),
 		"defaultAppId":  store.GetDefaultAppID(a.DB),
 		"normalizeMode": resolveNormalizeMode(),
-		"ssot":          "sqlite",
+		"ssot":          ssotName(a.DB),
 		"analytics":     "phase-a",
 		"search":        searchPhase(),
 	})
@@ -292,3 +294,11 @@ func (a *App) getEvidence(w http.ResponseWriter, r *http.Request) {
 // migrateFilesystemIfNeeded is a no-op until tables are empty and legacy FS exists.
 // Full markdown import lives with the write path; empty-table seed still runs after this.
 func migrateFilesystemIfNeeded(_ *sql.DB, _ string) error { return nil }
+
+// ssotName is the /health "ssot" value: "sqlite" (unchanged default) or "postgres".
+func ssotName(sqlDB *sql.DB) string {
+	if db.IsPostgres(sqlDB) {
+		return "postgres"
+	}
+	return "sqlite"
+}

@@ -9,7 +9,7 @@ Go control-plane of the Defect Drainer harness API. Goal: a static binary so ope
 
 Design: [`../docs/go-backend.md`](../docs/go-backend.md). Product framing: [`docs/workflow.md`](docs/workflow.md). Why the verification gates exist: [`docs/verification-hardening.md`](docs/verification-hardening.md).
 
-`serve` listens after POSIX `flock` + SQLite open and serves the console HTTP contract (inventory, intake, batches, search). `healthcheck` GETs `HOST:PORT/health` and exits 0 only when HTTP 200 **and** `ok: true`. The `worker` **subcommand** is still reserved (exit 1); batch-fix spawn runs **in-process** from `serve`.
+`serve` listens after POSIX `flock` + database open (SQLite by default) and serves the console HTTP contract (inventory, intake, batches, search). `healthcheck` GETs `HOST:PORT/health` and exits 0 only when HTTP 200 **and** `ok: true`. The `worker` **subcommand** is still reserved (exit 1); batch-fix spawn runs **in-process** from `serve`.
 
 ## Run
 
@@ -25,7 +25,7 @@ Or `make serve` / `make test` / `make build` (`CGO_ENABLED=0`). Cross-compile: `
 
 ## One-writer rule
 
-The inventory is **one SQLite file** plus umbrella `evidence/`. Only one backend process (TS **or** Go) may write a given data dir.
+The inventory is **one database** — a SQLite file by default, or Postgres when `DEFECT_DRAINER_DB_DRIVER=postgres` — plus umbrella `evidence/`. Only one backend process (TS **or** Go) may write a given data dir. Postgres mode does not create `defect-drainer.db`; the lock file is still `{DATA}/defect-drainer.lock`.
 
 - Mutex: both TS (`koffi` → `libc.flock`) and Go (`syscall.Flock`) take `LOCK_EX|LOCK_NB` on `{DATA}/defect-drainer.lock`. A second locker fails immediately and does not listen.
 - Operator backup: never start two servers against one data dir.
@@ -35,7 +35,9 @@ The inventory is **one SQLite file** plus umbrella `evidence/`. Only one backend
 | Env | Role |
 |-----|------|
 | `DEFECTS_ROOT` | Inventory / `evidence/` (no `DEFECT_DRAINER_` prefix) |
-| `DEFECT_DRAINER_DATA` | Runtime: `defect-drainer.db`, `jobs/`, `batch-jobs/`, `clones/` |
+| `DEFECT_DRAINER_DATA` | Runtime dir: SQLite `defect-drainer.db` (sqlite driver only), plus `jobs/`, `batch-jobs/`, `clones/`, and the lock |
+| `DEFECT_DRAINER_DB_DRIVER` | `sqlite` (default, also when empty) or `postgres`, case-insensitive. Anything else fails startup |
+| `DEFECT_DRAINER_DATABASE_URL` | Postgres DSN when the driver is `postgres`. Empty falls back to libpq `PG*` variables |
 | `DEFECT_DRAINER_HOST` / `PORT` | Listen (default `127.0.0.1:8788`) |
 
 Legacy `DEFECT_CHANNEL_*` is still read. `.env` is only `backend-go/.env`, loaded in `main()`, never overriding process env.
@@ -49,7 +51,31 @@ export DEFECTS_ROOT=/Users/joe/workspace/defect-drainer
 export DEFECT_DRAINER_DATA=/Users/joe/workspace/defect-drainer/backend-go/.data
 ```
 
-`healthcheck` uses **HOST/PORT only** (default `127.0.0.1:8788`). It does not walk `go.mod`, flock, or open SQLite.
+`healthcheck` uses **HOST/PORT only** (default `127.0.0.1:8788`). It does not walk `go.mod`, flock, or open the database.
+
+## Postgres mode (dev/staging on pi4)
+
+SQLite stays the default. Set `DEFECT_DRAINER_DB_DRIVER=postgres` to use the database already loaded on pi4 (`defect_drainer`). This process runs **no DDL** in Postgres mode: no `PRAGMA`, no `SCHEMA`, no `ALTER`, no FTS table. The schema must already exist. Startup pings and checks that `defects` is readable (`SELECT 1 FROM defects LIMIT 1`).
+
+`serve` still flocks `{DATA}/defect-drainer.lock` and still uses that directory for `jobs/`, `batch-jobs/`, and `clones/`. It does not create `defect-drainer.db`. `paths.Resolve` is unchanged and only auto-picks `.data` when that SQLite file already exists, so set `DEFECT_DRAINER_DATA` explicitly when it does not. The startup line prints `db=postgres` and never the DSN. `GET /health` reports `"ssot": "postgres"` (still `"sqlite"` by default).
+
+Search skips SQLite FTS5 (`defects_fts` is not in Postgres) and uses `ILIKE`. The response `mode` stays `"like"`. A real Postgres full-text index (`tsvector` + GIN) would need a migration; this process will not create one. Tables this code does not use — `test_plans`, `test_plan_steps`, `test_runs`, `test_step_results` — are left alone. Extra `apps` columns (`agent_max_turns`, `test_accounts_json`) are ignored because selects name their columns.
+
+The pi4 superuser role is temporary until a per-project role exists. The password lives only in `backend-go/.env` (`chmod 600`, gitignored). Do not commit it.
+
+From grok-bot-box, Postgres on pi4 is reached with userspace Tailscale (no tun) through a local relay:
+
+```bash
+socat TCP-LISTEN:15432,bind=127.0.0.1,reuseaddr,fork EXEC:"/home/box/tailscale/tailscale --socket=/home/box/.local/share/tailscale/tailscaled.sock nc 100.87.183.81 5432"
+```
+
+```bash
+DEFECT_DRAINER_DB_DRIVER=postgres
+DEFECT_DRAINER_DATABASE_URL=postgres://postgres:<password>@127.0.0.1:15432/defect_drainer?sslmode=prefer
+DEFECT_DRAINER_DATA=/tmp/defect-drainer-data
+```
+
+An empty `DEFECT_DRAINER_DATABASE_URL` is passed to pgx, which reads `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, and `PGSSLMODE` (libpq defaults otherwise). Ping must succeed.
 
 ## Batch-fix (in `serve`, after worktrees)
 

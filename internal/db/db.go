@@ -1,4 +1,5 @@
-// Package db opens the shared SQLite SSOT (same SCHEMA as the TS backend).
+// Package db opens the inventory database. SQLite (this file's Open) is the
+// default. Postgres is optional via OpenConfigured and runs no DDL.
 package db
 
 import (
@@ -152,6 +153,7 @@ CREATE INDEX IF NOT EXISTS idx_search_outbox_updated ON search_outbox(updated_at
 `
 
 // Open creates/opens {dataRoot}/defect-drainer.db, applies SCHEMA + migrations + FTS.
+// SQLite only. Postgres uses OpenConfigured and does not call Open.
 func Open(dataRoot string) (*sql.DB, error) {
 	if err := os.MkdirAll(dataRoot, 0o755); err != nil {
 		return nil, err
